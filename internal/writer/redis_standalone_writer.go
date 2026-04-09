@@ -21,6 +21,7 @@ import (
 type RedisWriterOptions struct {
 	Cluster   bool                   `mapstructure:"cluster" default:"false"`
 	Address   string                 `mapstructure:"address" default:""`
+	Addresses []string               `mapstructure:"addresses"`
 	Username  string                 `mapstructure:"username" default:""`
 	Password  string                 `mapstructure:"password" default:""`
 	Tls       bool                   `mapstructure:"tls" default:"false"`

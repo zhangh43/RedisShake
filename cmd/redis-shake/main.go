@@ -158,8 +158,14 @@ func main() {
 			log.Panicf("the RDBRestoreCommandBehavior can't be 'panic' when the server not reply to commands")
 		}
 		if opts.Cluster {
+			if len(opts.Addresses) == 0 && opts.Address != "" {
+				opts.Addresses = []string{opts.Address}
+			}
+			if len(opts.Addresses) == 0 {
+				log.Panicf("no address specified for RedisClusterWriter. set 'address' or 'addresses' in config")
+			}
 			log.Infof("create RedisClusterWriter")
-			log.Infof("* address (should be the address of one node in the Redis cluster): %s", opts.Address)
+			log.Infof("* addresses (seed nodes for Redis cluster): %v", opts.Addresses)
 			log.Infof("* username: %s", opts.Username)
 			log.Infof("* password: %s", strings.Repeat("*", len(opts.Password)))
 			log.Infof("* tls: %v", opts.Tls)

@@ -2,6 +2,7 @@ package writer
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"RedisShake/internal/entry"
@@ -37,7 +38,33 @@ func (r *RedisClusterWriter) Close() {
 }
 
 func (r *RedisClusterWriter) loadClusterNodes(ctx context.Context, opts *RedisWriterOptions) {
-	addresses, slots := utils.GetRedisClusterNodes(ctx, opts.Address, opts.Username, opts.Password, opts.Tls, opts.TlsConfig, false)
+	seedAddresses := opts.Addresses
+	if len(seedAddresses) == 0 {
+		seedAddresses = []string{opts.Address}
+	}
+
+	var addresses []string
+	var slots [][]int
+	var lastErr error
+	for _, seed := range seedAddresses {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					lastErr = fmt.Errorf("failed to connect to seed %s: %v", seed, r)
+					log.Warnf("redisClusterWriter: %v, trying next seed address", lastErr)
+				}
+			}()
+			addresses, slots = utils.GetRedisClusterNodes(ctx, seed, opts.Username, opts.Password, opts.Tls, opts.TlsConfig, false)
+		}()
+		if addresses != nil {
+			log.Infof("redisClusterWriter: successfully discovered cluster topology from seed %s", seed)
+			break
+		}
+	}
+	if addresses == nil {
+		log.Panicf("redisClusterWriter: failed to discover cluster topology from any seed address %v: %v", seedAddresses, lastErr)
+	}
+
 	r.addresses = addresses
 	for i, address := range addresses {
 		theOpts := *opts
