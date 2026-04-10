@@ -224,8 +224,6 @@ func (ld *Loader) parseRDBEntry(ctx context.Context, rd *bufio.Reader) {
 			// dump size = typeByte(1) + value + version(2) + crc(8)
 			dumpSize := uint64(1 + value.Len() + 2 + 8)
 			if dumpSize > config.Opt.Advanced.TargetRedisProtoMaxBulkLen {
-				log.Warnf("key=[%s] dump size=[%d] exceeds target_redis_proto_max_bulk_len, falling back to individual commands. "+
-					"rdb_restore_command_behavior setting may not work correctly for this key.", key, dumpSize)
 				// Use the commands from Rewrite()
 				for cmd := range cmdC {
 					e := entry.NewEntry()
