@@ -44,5 +44,5 @@ fi
 
 # build the current platform
 echo "try build for current platform"
-go build -v -trimpath -ldflags "${GO_LDFLAGS}" -o "$BIN_DIR/redis-shake" "./cmd/redis-shake"
+CGO_ENABLED=0 go build -v -trimpath -ldflags "${GO_LDFLAGS}" -o "$BIN_DIR/redis-shake" "./cmd/redis-shake"
 echo "build success"
