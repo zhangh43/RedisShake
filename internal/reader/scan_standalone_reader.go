@@ -57,6 +57,7 @@ type scanStandaloneReader struct {
 	subWG           sync.WaitGroup
 	queueLen        func() int
 	isValkey        bool
+	queueLen        func() int
 
 	stat struct {
 		Name              string `json:"name"`
