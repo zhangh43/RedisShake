@@ -18,6 +18,7 @@ type Entry struct {
 	Keys       []string
 	KeyIndexes []int
 	Slots      []int
+	RetryCount int
 
 	// for stat
 	SerializedSize int64

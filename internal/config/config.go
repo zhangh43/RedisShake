@@ -71,6 +71,9 @@ type AdvancedOptions struct {
 	TargetRedisClientMaxQuerybufLen int64  `mapstructure:"target_redis_client_max_querybuf_len" default:"1024000000"`
 	TargetRedisProtoMaxBulkLen      uint64 `mapstructure:"target_redis_proto_max_bulk_len" default:"512000000"`
 	TargetRedisMaxQPS               int    `mapstructure:"target_redis_max_qps" default:"300000"`
+	TargetRedisOOMRequeue           bool   `mapstructure:"target_redis_oom_requeue" default:"false"`
+	TargetRedisOOMRequeueMaxTimes   int    `mapstructure:"target_redis_oom_requeue_max_times" default:"3"`
+	TargetRedisOOMRequeueDelayMs    int    `mapstructure:"target_redis_oom_requeue_delay_ms" default:"500"`
 
 	AwsPSync string `mapstructure:"aws_psync" default:""` // 10.0.0.1:6379@nmfu2sl5osync,10.0.0.1:6379@xhma21xfkssync
 

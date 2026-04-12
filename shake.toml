@@ -20,6 +20,7 @@ try_diskless = false       # Set to true for diskless sync if the source has rep
 #ksn = false                # set to true to enabled Redis keyspace notifications (KSN) subscription
 #count = 1                  # number of keys to scan per iteration
 #scan_max_queue_len = 0     # pause SCAN when the internal dump queue reaches this length, 0 disables backpressure
+#drop_ksn_on_backpressure = false # drop newly received KSN updates while scan backpressure is active
 ## RedisShake uses the TYPE command to get each key's type.
 ## If the type is in this skip list, the key will be skipped.
 #skip_unknown_type = []  # e.g. ["imset", "mbloom", "string", "hash", "list", "set", "zset"]
@@ -145,6 +146,12 @@ pipeline_count_limit = 1024
 # If the performance of the target end is too poor or you want to protect the target redisyou can reduce this parameter
 # 300,000 is a maximum value. You can consider it as no rate limit
 target_redis_max_qps = 300000
+
+# When enabled, target-side OOM write errors will requeue the current command for retry.
+# This favors eventual consistency over strict ordering and may reorder writes.
+target_redis_oom_requeue = false
+target_redis_oom_requeue_max_times = 3
+target_redis_oom_requeue_delay_ms = 500
 
 # This setting corresponds to the 'client-query-buffer-limit' in Redis configuration.
 # The default value is typically 1GB.

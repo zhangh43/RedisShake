@@ -33,6 +33,7 @@ type redisStandaloneWriter struct {
 	address string
 	client  *client.Redis
 	DbId    int
+	ctx     context.Context
 
 	chWaitReply chan *entry.Entry
 	chWaitWg    sync.WaitGroup
@@ -75,6 +76,7 @@ func (w *redisStandaloneWriter) Close() {
 }
 
 func (w *redisStandaloneWriter) StartWrite(ctx context.Context) chan *entry.Entry {
+	w.ctx = ctx
 	w.chWg = sync.WaitGroup{}
 	w.chWg.Add(1)
 	go w.processWrite(ctx)
@@ -157,6 +159,25 @@ func (w *redisStandaloneWriter) processReply() {
 				} else if config.Opt.Advanced.RDBRestoreCommandBehavior == "panic" {
 					log.Panicf("[%s] redisStandaloneWriter received BUSYKEY reply. cmd=[%s]", w.stat.Name, e.String())
 				}
+			} else if w.shouldRequeueOnOOM(err, e) {
+				atomic.AddInt64(&w.stat.UnansweredBytes, -e.SerializedSize)
+				atomic.AddInt64(&w.stat.UnansweredEntries, -1)
+				e.RetryCount++
+				delay := time.Duration(config.Opt.Advanced.TargetRedisOOMRequeueDelayMs) * time.Millisecond
+				log.Warnf("[%s] receive reply failed with OOM. requeue cmd=[%s], retry_count=[%d/%d], delay=[%s]",
+					w.stat.Name, e.String(), e.RetryCount, config.Opt.Advanced.TargetRedisOOMRequeueMaxTimes, delay)
+				go func(en *entry.Entry) {
+					time.Sleep(delay)
+					if w.ctx != nil {
+						select {
+						case <-w.ctx.Done():
+							return
+						default:
+						}
+					}
+					w.Write(en)
+				}(e)
+				continue
 			} else {
 				log.Panicf("[%s] receive reply failed. cmd=[%s], error=[%v]", w.stat.Name, e.String(), err)
 			}
@@ -168,6 +189,30 @@ func (w *redisStandaloneWriter) processReply() {
 		atomic.AddInt64(&w.stat.UnansweredEntries, -1)
 	}
 	w.chWaitWg.Done()
+}
+
+func (w *redisStandaloneWriter) shouldRequeueOnOOM(err error, e *entry.Entry) bool {
+	if !config.Opt.Advanced.TargetRedisOOMRequeue {
+		return false
+	}
+	if e == nil || strings.EqualFold(e.CmdName, "select") {
+		return false
+	}
+	if e.RetryCount >= config.Opt.Advanced.TargetRedisOOMRequeueMaxTimes {
+		return false
+	}
+	if err == nil {
+		return false
+	}
+	return isTargetRedisOOMError(err)
+}
+
+func isTargetRedisOOMError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "out of memory") || strings.Contains(msg, "oom")
 }
 
 func (w *redisStandaloneWriter) Status() interface{} {

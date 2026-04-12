@@ -21,19 +21,20 @@ import (
 )
 
 type ScanReaderOptions struct {
-	Cluster         bool             `mapstructure:"cluster" default:"false"`
-	Address         string           `mapstructure:"address" default:""`
-	Username        string           `mapstructure:"username" default:""`
-	Password        string           `mapstructure:"password" default:""`
-	Tls             bool             `mapstructure:"tls" default:"false"`
-	TlsConfig       client.TlsConfig `mapstructure:"tls_config" default:"{}"`
-	Scan            bool             `mapstructure:"scan" default:"true"`
-	KSN             bool             `mapstructure:"ksn" default:"false"`
-	DBS             []int            `mapstructure:"dbs"`
-	PreferReplica   bool             `mapstructure:"prefer_replica" default:"false"`
-	Count           int              `mapstructure:"count" default:"1"`
-	ScanMaxQueueLen int              `mapstructure:"scan_max_queue_len" default:"0"`
-	SkipUnknownType []string         `mapstructure:"skip_unknown_type" default:"[]"`
+	Cluster               bool             `mapstructure:"cluster" default:"false"`
+	Address               string           `mapstructure:"address" default:""`
+	Username              string           `mapstructure:"username" default:""`
+	Password              string           `mapstructure:"password" default:""`
+	Tls                   bool             `mapstructure:"tls" default:"false"`
+	TlsConfig             client.TlsConfig `mapstructure:"tls_config" default:"{}"`
+	Scan                  bool             `mapstructure:"scan" default:"true"`
+	KSN                   bool             `mapstructure:"ksn" default:"false"`
+	DBS                   []int            `mapstructure:"dbs"`
+	PreferReplica         bool             `mapstructure:"prefer_replica" default:"false"`
+	Count                 int              `mapstructure:"count" default:"1"`
+	ScanMaxQueueLen       int              `mapstructure:"scan_max_queue_len" default:"0"`
+	DropKSNOnBackpressure bool             `mapstructure:"drop_ksn_on_backpressure" default:"false"`
+	SkipUnknownType       []string         `mapstructure:"skip_unknown_type" default:"[]"`
 }
 
 type dbKey struct {
@@ -57,7 +58,6 @@ type scanStandaloneReader struct {
 	subWG           sync.WaitGroup
 	queueLen        func() int
 	isValkey        bool
-	queueLen        func() int
 
 	stat struct {
 		Name              string `json:"name"`
@@ -66,6 +66,7 @@ type scanStandaloneReader struct {
 		ScanCursor        uint64 `json:"scan_cursor"`
 		ScanPercentByDbId string `json:"scan_percent"`
 		NeedUpdateCount   int64  `json:"need_update_count"`
+		KSNDroppedCount   int64  `json:"ksn_dropped_count"`
 	}
 }
 
@@ -112,6 +113,16 @@ func (r *scanStandaloneReader) waitForScanQueueCapacity(dbId int) bool {
 			r.stat.Name, r.getQueueLen(), r.opts.ScanMaxQueueLen, dbId)
 	}
 	return true
+}
+
+func (r *scanStandaloneReader) shouldDropKSNOnBackpressure() bool {
+	if !r.opts.DropKSNOnBackpressure {
+		return false
+	}
+	if r.opts.ScanMaxQueueLen <= 0 {
+		return false
+	}
+	return r.getQueueLen() >= r.opts.ScanMaxQueueLen
 }
 
 func (r *scanStandaloneReader) StartRead(ctx context.Context) []chan *entry.Entry {
@@ -181,6 +192,10 @@ func (r *scanStandaloneReader) subscribe() {
 				e.DbId = dbIdInt
 				e.Argv = []string{"DEL", key}
 				r.ch <- e
+				continue
+			}
+			if r.shouldDropKSNOnBackpressure() {
+				r.stat.KSNDroppedCount++
 				continue
 			}
 			r.needDumpQueue.Put(dbKey{db: dbIdInt, key: key})

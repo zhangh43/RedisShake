@@ -49,6 +49,7 @@ scan = true                # set to false if you don't want to scan keys
 ksn = false                # set to true to enabled Redis keyspace notifications (KSN) subscription
 count = 1                  # number of keys to scan per iteration
 scan_max_queue_len = 0     # pause SCAN when the internal dump queue reaches this length, 0 disables backpressure
+drop_ksn_on_backpressure = false # drop newly received KSN updates while scan backpressure is active
 ```
 
 * `cluster`: Whether the source is a cluster
@@ -63,3 +64,4 @@ scan_max_queue_len = 0     # pause SCAN when the internal dump queue reaches thi
 * `ksn`: After enabling the `ksn` parameter, RedisShake will subscribe to Key changes at the source to achieve incremental synchronization
 * `count`: The number of keys fetched from the source each time during full synchronization. The default is 1. Changing to a larger value can significantly improve synchronization efficiency, but will also increase pressure on the source.
 * `scan_max_queue_len`: Only applies to the SCAN stage. When the internal pending DUMP queue reaches this threshold, RedisShake pauses further SCAN calls; scanning resumes automatically once the queue length falls below the threshold. `ksn` subscriptions are not affected. Set to `0` to disable this backpressure.
+* `drop_ksn_on_backpressure`: Only applies when `scan_max_queue_len > 0`. When enabled, newly received KSN updates are dropped instead of being enqueued while SCAN backpressure is active. This limits queue growth at the cost of incremental completeness. Disabled by default.
