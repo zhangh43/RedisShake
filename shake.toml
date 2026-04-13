@@ -19,8 +19,12 @@ try_diskless = false       # Set to true for diskless sync if the source has rep
 #scan = true                # set to false if you don't want to scan keys
 #ksn = false                # set to true to enabled Redis keyspace notifications (KSN) subscription
 #count = 1                  # number of keys to scan per iteration
-#scan_max_queue_len = 0     # pause SCAN when the internal dump queue reaches this length, 0 disables backpressure
+#scan_high_queue_len = 500000 # pause SCAN when queue length reaches this high watermark
+#scan_low_queue_len = 0     # resume SCAN when queue length drops to or below this low watermark
 #drop_ksn_on_backpressure = false # drop newly received KSN updates while scan backpressure is active
+#sample_on_start = true     # log sampled key/value previews for each DB before syncing starts
+#sample_count_per_db = 3    # number of sampled keys to log per DB
+#sample_value_max_len = 256 # truncate sampled value previews to this many characters
 ## RedisShake uses the TYPE command to get each key's type.
 ## If the type is in this skip list, the key will be skipped.
 #skip_unknown_type = []  # e.g. ["imset", "mbloom", "string", "hash", "list", "set", "zset"]
@@ -109,13 +113,16 @@ status_port = 0 # status port, 0 means disable
 
 # log
 log_file = "shake.log"
-log_level = "info"     # debug, info or warn
+log_level = "info"     # trace, debug, info, warn, error, fatal, panic, disabled
 log_interval = 5       # in seconds
 log_rotation = true    # enable log rotation
 log_max_size = 512     # MiB, logs max size to rotate, default 512 MiB
 log_max_age = 7        # days, logs are kept, default 7 days
 log_max_backups = 3    # number of log backups, default 3
 log_compress = true    # enable log compression after rotate, default true
+io_reconnect = true
+io_reconnect_max_times = 10
+io_reconnect_delay_ms = 1000
 
 # redis-shake gets key and value from rdb file, and uses RESTORE command to
 # create the key in target redis. Redis RESTORE will return a "Target key name

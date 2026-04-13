@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/rs/zerolog"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -14,19 +15,14 @@ var logger zerolog.Logger
 
 func Init(level string, file string, dir string, rotation bool, size int, age int, backups int, compress bool) {
 	// log level
-	switch level {
-	case "debug":
-		zerolog.SetGlobalLevel(zerolog.DebugLevel)
-	case "info":
-		zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	case "warn":
-		zerolog.SetGlobalLevel(zerolog.WarnLevel)
-	default:
+	parsedLevel, err := zerolog.ParseLevel(strings.ToLower(level))
+	if err != nil {
 		panic(fmt.Sprintf("unknown log level: %s", level))
 	}
+	zerolog.SetGlobalLevel(parsedLevel)
 
 	// dir
-	dir, err := filepath.Abs(dir)
+	dir, err = filepath.Abs(dir)
 	if err != nil {
 		panic(fmt.Sprintf("failed to determine current directory: %v", err))
 	}

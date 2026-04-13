@@ -1,6 +1,8 @@
 package client
 
 import (
+	"errors"
+	"io"
 	"testing"
 )
 
@@ -124,5 +126,24 @@ redis_mode:standalone
 				t.Errorf("ParseServerVersion() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIsReconnectableIOError(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{errors.New("unexpected EOF"), true},
+		{io.EOF, true},
+		{errors.New("connection reset by peer"), true},
+		{errors.New("broken pipe"), true},
+		{errors.New("i/o timeout"), true},
+		{errors.New("ERR unknown command"), false},
+	}
+	for _, tc := range cases {
+		if got := IsReconnectableIOError(tc.err); got != tc.want {
+			t.Fatalf("IsReconnectableIOError(%v)=%v want %v", tc.err, got, tc.want)
+		}
 	}
 }
