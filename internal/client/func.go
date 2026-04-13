@@ -3,7 +3,10 @@ package client
 import (
 	"bytes"
 	"errors"
+	"io"
+	"net"
 	"strings"
+	"syscall"
 
 	"RedisShake/internal/client/proto"
 	"RedisShake/internal/log"
@@ -53,4 +56,26 @@ func (r *Redis) IsValkey() bool {
 		return false
 	}
 	return isValkey
+}
+
+func IsReconnectableIOError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "timeout")
 }

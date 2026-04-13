@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net"
 	"os"
 	"regexp"
@@ -17,6 +18,13 @@ import (
 )
 
 type Redis struct {
+	ctx         context.Context
+	address     string
+	username    string
+	password    string
+	tls         bool
+	tlsConfig   TlsConfig
+	replica     bool
 	conn        net.Conn
 	reader      *bufio.Reader
 	writer      *bufio.Writer
@@ -32,25 +40,40 @@ type TlsConfig struct {
 
 func NewRedisClient(ctx context.Context, address string, username string, password string, Tls bool, tlsConfig TlsConfig, replica bool) *Redis {
 	r := new(Redis)
+	r.ctx = ctx
+	r.address = address
+	r.username = username
+	r.password = password
+	r.tls = Tls
+	r.tlsConfig = tlsConfig
+	r.replica = replica
+	err := r.connect()
+	if err != nil {
+		log.Panicf("dial failed. address=[%s], tls=[%v], err=[%v]", address, Tls, err)
+	}
+	return r
+}
+
+func (r *Redis) connect() error {
 	var conn net.Conn
 	var dialer = &net.Dialer{
 		Timeout:   5 * time.Minute,
 		KeepAlive: 5 * time.Minute,
 	}
-	ctxWithDeadline, cancel := context.WithTimeout(ctx, 1*time.Second)
+	ctxWithDeadline, cancel := context.WithTimeout(r.ctx, 1*time.Second)
 	defer cancel()
 	var err error
-	if Tls {
+	if r.tls {
 		tlsDialer := &tls.Dialer{
 			NetDialer: dialer,
-			Config:    getTlsConfig(tlsConfig),
+			Config:    getTlsConfig(r.tlsConfig),
 		}
-		conn, err = tlsDialer.DialContext(ctxWithDeadline, "tcp", address)
+		conn, err = tlsDialer.DialContext(ctxWithDeadline, "tcp", r.address)
 	} else {
-		conn, err = dialer.DialContext(ctxWithDeadline, "tcp", address)
+		conn, err = dialer.DialContext(ctxWithDeadline, "tcp", r.address)
 	}
 	if err != nil {
-		log.Panicf("dial failed. address=[%s], tls=[%v], err=[%v]", address, Tls, err)
+		return err
 	}
 
 	r.conn = conn
@@ -61,32 +84,53 @@ func NewRedisClient(ctx context.Context, address string, username string, passwo
 	r.protoWriter = proto.NewWriter(r.writer)
 
 	// auth
-	if password != "" {
-		var reply string
-		if username != "" {
-			reply = r.DoWithStringReply("auth", username, password)
+	if r.password != "" {
+		var (
+			reply string
+			err   error
+		)
+		if r.username != "" {
+			reply, err = r.DoWithStringReplyWithError("auth", r.username, r.password)
 		} else {
-			reply = r.DoWithStringReply("auth", password)
+			reply, err = r.DoWithStringReplyWithError("auth", r.password)
+		}
+		if err != nil {
+			return err
 		}
 		if reply != "OK" {
-			log.Panicf("auth failed with reply: %s", reply)
+			return errors.New("auth failed with reply: " + reply)
 		}
 	}
 
 	// ping to test connection
-	reply := r.DoWithStringReply("ping")
+	reply, err := r.DoWithStringReplyWithError("ping")
+	if err != nil {
+		return err
+	}
 	if reply != "PONG" {
-		panic("ping failed with reply: " + reply)
+		return errors.New("ping failed with reply: " + reply)
 	}
 	// get best replica
-	if replica {
-		reply = r.DoWithStringReply("info", "replication")
-		replicaInfo := getReplicaAddr(reply, address)
+	if r.replica {
+		reply, err = r.DoWithStringReplyWithError("info", "replication")
+		if err != nil {
+			return err
+		}
+		replicaInfo := getReplicaAddr(reply, r.address)
 		log.Infof("best replica: %s", replicaInfo.BestReplica)
-		r = NewRedisClient(ctx, replicaInfo.BestReplica, username, password, Tls, tlsConfig, false)
+		r.address = replicaInfo.BestReplica
+		r.replica = false
+		return r.connect()
 	}
 
-	return r
+	return nil
+}
+
+func (r *Redis) Reconnect() error {
+	if r.conn != nil {
+		_ = r.conn.Close()
+	}
+	return r.connect()
 }
 
 func getTlsConfig(tlsConfig TlsConfig) *tls.Config {
@@ -183,6 +227,21 @@ func (r *Redis) DoWithStringReply(args ...interface{}) string {
 	return reply
 }
 
+func (r *Redis) DoWithStringReplyWithError(args ...interface{}) (string, error) {
+	if err := r.SendWithError(args...); err != nil {
+		return "", err
+	}
+	replyInterface, err := r.Receive()
+	if err != nil {
+		return "", err
+	}
+	reply, ok := replyInterface.(string)
+	if !ok {
+		return "", errors.New("reply is not string")
+	}
+	return reply, nil
+}
+
 func (r *Redis) Do(args ...interface{}) interface{} {
 	r.Send(args...)
 
@@ -205,6 +264,17 @@ func (r *Redis) Send(args ...interface{}) {
 	r.Flush()
 }
 
+func (r *Redis) SendWithError(args ...interface{}) error {
+	argsInterface := make([]interface{}, len(args))
+	for inx, item := range args {
+		argsInterface[inx] = item
+	}
+	if err := r.protoWriter.WriteArgs(argsInterface); err != nil {
+		return err
+	}
+	return r.FlushWithError()
+}
+
 // SendBytesBuff send bytes to buffer, need to call Flush() to send the buffer
 func (r *Redis) SendBytesBuff(buf []byte) {
 	_, err := r.writer.Write(buf)
@@ -213,11 +283,20 @@ func (r *Redis) SendBytesBuff(buf []byte) {
 	}
 }
 
+func (r *Redis) SendBytesBuffWithError(buf []byte) error {
+	_, err := r.writer.Write(buf)
+	return err
+}
+
 func (r *Redis) Flush() {
 	err := r.writer.Flush()
 	if err != nil {
 		log.Panicf(err.Error())
 	}
+}
+
+func (r *Redis) FlushWithError() error {
+	return r.writer.Flush()
 }
 
 func (r *Redis) Receive() (interface{}, error) {
@@ -278,6 +357,30 @@ func (r *Redis) Scan(cursor uint64, count int) (newCursor uint64, keys []string)
 		log.Panicf(err.Error())
 	}
 	// keys
+	keys = make([]string, 0)
+	for _, item := range array[1].([]interface{}) {
+		keys = append(keys, item.(string))
+	}
+	return
+}
+
+func (r *Redis) ScanWithError(cursor uint64, count int) (newCursor uint64, keys []string, err error) {
+	if err = r.SendWithError("scan", strconv.FormatUint(cursor, 10), "count", count); err != nil {
+		return 0, nil, err
+	}
+	reply, err := r.Receive()
+	if err != nil {
+		return 0, nil, err
+	}
+
+	array := reply.([]interface{})
+	if len(array) != 2 {
+		return 0, nil, errors.New("scan return length error")
+	}
+	newCursor, err = strconv.ParseUint(array[0].(string), 10, 64)
+	if err != nil {
+		return 0, nil, err
+	}
 	keys = make([]string, 0)
 	for _, item := range array[1].([]interface{}) {
 		keys = append(keys, item.(string))

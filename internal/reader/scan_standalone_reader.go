@@ -32,9 +32,13 @@ type ScanReaderOptions struct {
 	DBS                   []int            `mapstructure:"dbs"`
 	PreferReplica         bool             `mapstructure:"prefer_replica" default:"false"`
 	Count                 int              `mapstructure:"count" default:"1"`
-	ScanMaxQueueLen       int              `mapstructure:"scan_max_queue_len" default:"0"`
+	ScanHighQueueLen      int              `mapstructure:"scan_high_queue_len" default:"500000"`
+	ScanLowQueueLen       int              `mapstructure:"scan_low_queue_len" default:"0"`
 	DropKSNOnBackpressure bool             `mapstructure:"drop_ksn_on_backpressure" default:"false"`
 	SkipUnknownType       []string         `mapstructure:"skip_unknown_type" default:"[]"`
+	SampleOnStart         bool             `mapstructure:"sample_on_start" default:"true"`
+	SampleCountPerDB      int              `mapstructure:"sample_count_per_db" default:"3"`
+	SampleValueMaxLen     int              `mapstructure:"sample_value_max_len" default:"256"`
 }
 
 type dbKey struct {
@@ -57,16 +61,24 @@ type scanStandaloneReader struct {
 	dumpClient      *client.Redis
 	subWG           sync.WaitGroup
 	queueLen        func() int
+	reconnectFn     func(*client.Redis) error
 	isValkey        bool
+	ksnDropLogged   bool
+	scanPaused      bool
 
 	stat struct {
-		Name              string `json:"name"`
-		ScanFinished      bool   `json:"scan_finished"`
-		ScanDbId          int    `json:"scan_dbId"`
-		ScanCursor        uint64 `json:"scan_cursor"`
-		ScanPercentByDbId string `json:"scan_percent"`
-		NeedUpdateCount   int64  `json:"need_update_count"`
-		KSNDroppedCount   int64  `json:"ksn_dropped_count"`
+		Name              string  `json:"name"`
+		ScanFinished      bool    `json:"scan_finished"`
+		ScanDbId          int     `json:"scan_dbId"`
+		ScanCursor        uint64  `json:"scan_cursor"`
+		ScanPercentByDbId string  `json:"scan_percent"`
+		SyncedKeyCount    int64   `json:"synced_key_count"`
+		SyncedKeyOps      float64 `json:"synced_key_ops"`
+		NeedUpdateCount   int64   `json:"need_update_count"`
+		KSNDroppedCount   int64   `json:"ksn_dropped_count"`
+
+		lastSyncedKeyCount          int64
+		lastSyncedKeyUpdateTSSecond float64
 	}
 }
 
@@ -90,27 +102,44 @@ func (r *scanStandaloneReader) getQueueLen() int {
 	return 0
 }
 
+func (r *scanStandaloneReader) getScanHighQueueLen() int {
+	return r.opts.ScanHighQueueLen
+}
+
+func (r *scanStandaloneReader) getScanLowQueueLen() int {
+	if r.opts.ScanLowQueueLen > 0 {
+		return r.opts.ScanLowQueueLen
+	}
+	return r.opts.ScanHighQueueLen
+}
+
 func (r *scanStandaloneReader) waitForScanQueueCapacity(dbId int) bool {
-	if r.opts.ScanMaxQueueLen <= 0 {
+	high := r.getScanHighQueueLen()
+	low := r.getScanLowQueueLen()
+	if high <= 0 {
 		return true
 	}
+	if low > high {
+		low = high
+	}
 
-	backpressureLogged := false
-	for r.getQueueLen() >= r.opts.ScanMaxQueueLen {
-		if !backpressureLogged {
-			log.Infof("[%s] scan backpressure activated. queue_len=[%d], scan_max_queue_len=[%d], db=[%d]",
-				r.stat.Name, r.getQueueLen(), r.opts.ScanMaxQueueLen, dbId)
-			backpressureLogged = true
-		}
+	if !r.scanPaused && r.getQueueLen() >= high {
+		log.Warnf("[%s] scan backpressure activated. queue_len=[%d], scan_high_queue_len=[%d], scan_low_queue_len=[%d], db=[%d]",
+			r.stat.Name, r.getQueueLen(), high, low, dbId)
+		r.scanPaused = true
+	}
+
+	for r.scanPaused && r.getQueueLen() > low {
 		select {
 		case <-r.ctx.Done():
 			return false
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	if backpressureLogged {
-		log.Infof("[%s] scan backpressure released. queue_len=[%d], scan_max_queue_len=[%d], db=[%d]",
-			r.stat.Name, r.getQueueLen(), r.opts.ScanMaxQueueLen, dbId)
+	if r.scanPaused {
+		log.Warnf("[%s] scan backpressure released. queue_len=[%d], scan_high_queue_len=[%d], scan_low_queue_len=[%d], db=[%d]",
+			r.stat.Name, r.getQueueLen(), high, low, dbId)
+		r.scanPaused = false
 	}
 	return true
 }
@@ -119,14 +148,33 @@ func (r *scanStandaloneReader) shouldDropKSNOnBackpressure() bool {
 	if !r.opts.DropKSNOnBackpressure {
 		return false
 	}
-	if r.opts.ScanMaxQueueLen <= 0 {
+	if r.getScanHighQueueLen() <= 0 {
 		return false
 	}
-	return r.getQueueLen() >= r.opts.ScanMaxQueueLen
+	return r.scanPaused || r.getQueueLen() >= r.getScanHighQueueLen()
+}
+
+func (r *scanStandaloneReader) logKSNDropState(active bool) {
+	if active {
+		if r.ksnDropLogged {
+			return
+		}
+		log.Warnf("[%s] drop_ksn_on_backpressure activated. queue_len=[%d], scan_high_queue_len=[%d], scan_low_queue_len=[%d]",
+			r.stat.Name, r.getQueueLen(), r.getScanHighQueueLen(), r.getScanLowQueueLen())
+		r.ksnDropLogged = true
+		return
+	}
+	if r.ksnDropLogged {
+		log.Warnf("[%s] drop_ksn_on_backpressure released. queue_len=[%d], scan_high_queue_len=[%d], scan_low_queue_len=[%d]",
+			r.stat.Name, r.getQueueLen(), r.getScanHighQueueLen(), r.getScanLowQueueLen())
+		r.ksnDropLogged = false
+	}
 }
 
 func (r *scanStandaloneReader) StartRead(ctx context.Context) []chan *entry.Entry {
 	r.ctx = ctx
+	r.logStartupSamples()
+	go r.runSyncedKeyOPSTicker()
 	if r.opts.KSN {
 		r.subWG.Add(1)
 		go r.subscribe()
@@ -140,16 +188,241 @@ func (r *scanStandaloneReader) StartRead(ctx context.Context) []chan *entry.Entr
 	return []chan *entry.Entry{r.ch}
 }
 
+func (r *scanStandaloneReader) doSourceCommand(c *client.Redis, args ...interface{}) (interface{}, error) {
+	if err := c.SendWithError(args...); err != nil {
+		return nil, err
+	}
+	return c.Receive()
+}
+
+func (r *scanStandaloneReader) resolveScanDBs(c *client.Redis) []int {
+	if len(r.dbs) > 0 {
+		return r.dbs
+	}
+	reply, err := r.doSourceCommand(c, "info", "keyspace")
+	if err != nil {
+		log.Warnf("[%s] startup sampling skipped: load db list failed. err=[%v]", r.stat.Name, err)
+		return nil
+	}
+	dbs := utils.ParseDBs(reply.(string))
+	if len(dbs) == 0 {
+		dbs = []int{0}
+	}
+	return dbs
+}
+
+func (r *scanStandaloneReader) logStartupSamples() {
+	if !r.opts.SampleOnStart {
+		return
+	}
+	sampleCount := r.opts.SampleCountPerDB
+	if sampleCount <= 0 {
+		sampleCount = 3
+	}
+	c := client.NewRedisClient(r.ctx, r.opts.Address, r.opts.Username, r.opts.Password, r.opts.Tls, r.opts.TlsConfig, r.opts.PreferReplica)
+	defer c.Close()
+
+	dbs := r.resolveScanDBs(c)
+	for _, dbId := range dbs {
+		r.logStartupSamplesForDB(c, dbId, sampleCount)
+	}
+}
+
+func (r *scanStandaloneReader) logStartupSamplesForDB(c *client.Redis, dbId int, sampleCount int) {
+	r.selectSourceDB(c, dbId)
+	log.Infof("[%s] startup sampling begin. db=[%d], sample_count=[%d]", r.stat.Name, dbId, sampleCount)
+
+	cursor := uint64(0)
+	collected := 0
+	for collected < sampleCount {
+		newCursor, keys, err := c.ScanWithError(cursor, sampleCount)
+		if err != nil {
+			log.Warnf("[%s] startup sampling aborted. db=[%d], err=[%v]", r.stat.Name, dbId, err)
+			return
+		}
+		cursor = newCursor
+		for _, key := range keys {
+			if err := r.logSampleKey(c, dbId, key); err != nil {
+				log.Warnf("[%s] startup sampling key failed. db=[%d], key=[%s], err=[%v]", r.stat.Name, dbId, key, err)
+				continue
+			}
+			collected++
+			if collected >= sampleCount {
+				break
+			}
+		}
+		if cursor == 0 {
+			break
+		}
+	}
+	log.Infof("[%s] startup sampling finished. db=[%d], sampled=[%d]", r.stat.Name, dbId, collected)
+}
+
+func (r *scanStandaloneReader) logSampleKey(c *client.Redis, dbId int, key string) error {
+	reply, err := r.doSourceCommand(c, "TYPE", key)
+	if err != nil {
+		return err
+	}
+	keyType, ok := reply.(string)
+	if !ok {
+		return errors.New("sample TYPE reply is not string")
+	}
+	preview, err := r.fetchSampleValuePreview(c, key, keyType)
+	if err != nil {
+		return err
+	}
+	log.Infof("[%s] startup sample. db=[%d], key=[%s], type=[%s], value_preview=[%s]",
+		r.stat.Name, dbId, key, keyType, preview)
+	return nil
+}
+
+func (r *scanStandaloneReader) fetchSampleValuePreview(c *client.Redis, key string, keyType string) (string, error) {
+	const collectionSampleCount = 5
+	var (
+		reply interface{}
+		err   error
+	)
+	switch strings.ToLower(keyType) {
+	case "string":
+		reply, err = r.doSourceCommand(c, "GET", key)
+	case "hash":
+		reply, err = r.doSourceCommand(c, "HGETALL", key)
+	case "list":
+		reply, err = r.doSourceCommand(c, "LRANGE", key, 0, collectionSampleCount-1)
+	case "set":
+		reply, err = r.doSourceCommand(c, "SSCAN", key, 0, "COUNT", collectionSampleCount)
+	case "zset":
+		reply, err = r.doSourceCommand(c, "ZRANGE", key, 0, collectionSampleCount-1, "WITHSCORES")
+	case "stream":
+		reply, err = r.doSourceCommand(c, "XRANGE", key, "-", "+", "COUNT", collectionSampleCount)
+	default:
+		return "unsupported-type-preview", nil
+	}
+	if err != nil {
+		if errors.Is(err, proto.Nil) {
+			return "nil", nil
+		}
+		return "", err
+	}
+	return truncateSampleValue(formatSampleReply(reply), r.opts.SampleValueMaxLen), nil
+}
+
+func formatSampleReply(reply interface{}) string {
+	switch v := reply.(type) {
+	case nil:
+		return "nil"
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	case []interface{}:
+		items := make([]string, 0, len(v))
+		for _, item := range v {
+			items = append(items, formatSampleReply(item))
+		}
+		return "[" + strings.Join(items, ", ") + "]"
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func truncateSampleValue(value string, maxLen int) string {
+	if maxLen <= 0 {
+		maxLen = 256
+	}
+	if len(value) <= maxLen {
+		return value
+	}
+	if maxLen <= 3 {
+		return value[:maxLen]
+	}
+	return value[:maxLen-3] + "..."
+}
+
+func (r *scanStandaloneReader) reconnectSource(c *client.Redis, reason error) bool {
+	if !config.Opt.Advanced.IOReconnect || !client.IsReconnectableIOError(reason) {
+		return false
+	}
+	delay := time.Duration(config.Opt.Advanced.IOReconnectDelayMs) * time.Millisecond
+	for attempt := 1; attempt <= config.Opt.Advanced.IOReconnectMaxTimes; attempt++ {
+		log.Warnf("[%s] reconnecting source redis. attempt=[%d/%d], delay=[%s], error=[%v]",
+			r.stat.Name, attempt, config.Opt.Advanced.IOReconnectMaxTimes, delay, reason)
+		time.Sleep(delay)
+		reconnectFn := r.reconnectFn
+		if reconnectFn == nil {
+			reconnectFn = func(rc *client.Redis) error { return rc.Reconnect() }
+		}
+		if err := reconnectFn(c); err == nil {
+			log.Warnf("[%s] reconnected source redis", r.stat.Name)
+			return true
+		}
+	}
+	return false
+}
+
+func (r *scanStandaloneReader) selectSourceDB(c *client.Redis, dbId int) {
+	if dbId == 0 {
+		return
+	}
+	for {
+		reply, err := c.DoWithStringReplyWithError("SELECT", strconv.Itoa(dbId))
+		if err == nil && reply == "OK" {
+			return
+		}
+		reason := err
+		if reason == nil {
+			reason = errors.New("scanStandaloneReader select db failed")
+		}
+		if !r.reconnectSource(c, reason) {
+			log.Panicf("scanStandaloneReader select db failed. db=[%d]", dbId)
+		}
+	}
+}
+
+func (r *scanStandaloneReader) scanKeys(c *client.Redis, dbId int, cursor uint64, count int) (uint64, []string) {
+	for {
+		newCursor, keys, err := c.ScanWithError(cursor, count)
+		if err == nil {
+			return newCursor, keys
+		}
+		if !r.reconnectSource(c, err) {
+			log.Panicf(err.Error())
+		}
+		r.selectSourceDB(c, dbId)
+	}
+}
+
+func (r *scanStandaloneReader) sendDumpSequence(dbId int, key string) {
+	for {
+		if r.dumpClient.SendWithError("SELECT", strconv.Itoa(dbId)) == nil &&
+			r.dumpClient.SendWithError("DUMP", key) == nil &&
+			r.dumpClient.SendWithError("PTTL", key) == nil {
+			if len(r.opts.SkipUnknownType) == 0 || r.dumpClient.SendWithError("TYPE", key) == nil {
+				return
+			}
+		}
+		if !r.reconnectSource(r.dumpClient, errors.New("unexpected EOF")) {
+			log.Panicf("scanStandaloneReader dump failed. db=[%d], key=[%s]", dbId, key)
+		}
+	}
+}
+
+func (r *scanStandaloneReader) resendDumpSequence(dbId int, key string) {
+	r.sendDumpSequence(dbId, key)
+}
+
 func (r *scanStandaloneReader) subscribe() {
 	c := client.NewRedisClient(r.ctx, r.opts.Address, r.opts.Username, r.opts.Password, r.opts.Tls, r.opts.TlsConfig, r.opts.PreferReplica)
 	log.Infof("[%s] scanStandaloneReader subscribe started. dbs=[%v]", r.stat.Name, r.dbs)
-	if len(r.dbs) == 0 {
-		c.Send("psubscribe", "__keyevent@*__:*")
-		_, err := c.Receive()
-		if err != nil {
-			log.Panicf(err.Error())
+	subscribe := func() {
+		if len(r.dbs) == 0 {
+			c.Send("psubscribe", "__keyevent@*__:*")
+			_, err := c.Receive()
+			if err != nil {
+				log.Panicf(err.Error())
+			}
+			return
 		}
-	} else {
 		args := []interface{}{"psubscribe"}
 		for _, db := range r.dbs {
 			args = append(args, fmt.Sprintf("__keyevent@%v__:*", db))
@@ -162,6 +435,7 @@ func (r *scanStandaloneReader) subscribe() {
 			}
 		}
 	}
+	subscribe()
 
 	// wait
 	r.subWG.Done()
@@ -176,6 +450,10 @@ func (r *scanStandaloneReader) subscribe() {
 		default:
 			resp, err := c.Receive()
 			if err != nil {
+				if r.reconnectSource(c, err) {
+					subscribe()
+					continue
+				}
 				log.Panicf(err.Error())
 			}
 			respSlice := resp.([]interface{})
@@ -194,7 +472,9 @@ func (r *scanStandaloneReader) subscribe() {
 				r.ch <- e
 				continue
 			}
-			if r.shouldDropKSNOnBackpressure() {
+			dropKSN := r.shouldDropKSNOnBackpressure()
+			r.logKSNDropState(dropKSN)
+			if dropKSN {
 				r.stat.KSNDroppedCount++
 				continue
 			}
@@ -216,12 +496,7 @@ func (r *scanStandaloneReader) scan() {
 		dbs = utils.ParseDBs(info.(string))
 	}
 	for _, dbId := range dbs {
-		if dbId != 0 {
-			reply := c.DoWithStringReply("SELECT", strconv.Itoa(dbId))
-			if reply != "OK" {
-				log.Panicf("scanStandaloneReader select db failed. db=[%d]", dbId)
-			}
-		}
+		r.selectSourceDB(c, dbId)
 
 		var cursor uint64 = 0
 		count := r.opts.Count
@@ -240,7 +515,7 @@ func (r *scanStandaloneReader) scan() {
 			}
 
 			var keys []string
-			cursor, keys = c.Scan(cursor, count)
+			cursor, keys = r.scanKeys(c, dbId, cursor, count)
 			for _, key := range keys {
 				r.needDumpQueue.Put(dbKey{dbId, key}) // pass value not pointer
 			}
@@ -277,15 +552,9 @@ func (r *scanStandaloneReader) dump() {
 		dbId := item.(dbKey).db
 		key := item.(dbKey).key
 		if nowDbId != dbId {
-			r.dumpClient.Send("SELECT", strconv.Itoa(dbId))
 			nowDbId = dbId
 		}
-		// dump
-		r.dumpClient.Send("DUMP", key)
-		r.dumpClient.Send("PTTL", key)
-		if len(r.opts.SkipUnknownType) > 0 {
-			r.dumpClient.Send("TYPE", key)
-		}
+		r.sendDumpSequence(dbId, key)
 		r.needRestoreChan <- &needRestoreItem{dbId, key}
 	}
 	close(r.needRestoreChan)
@@ -302,17 +571,30 @@ func (r *scanStandaloneReader) restore() {
 		dbId := item.dbId
 		key := item.key
 		if nowDbId != dbId {
-			reply, err := r.dumpClient.Receive()
-			if err != nil || reply != "OK" {
-				log.Panicf("scanStandaloneReader select db failed. db=[%d]", dbId)
-			}
 			nowDbId = dbId
+		}
+	retryReceive:
+		reply, err := r.dumpClient.Receive()
+		if err != nil || reply != "OK" {
+			reason := err
+			if reason == nil {
+				reason = errors.New("scanStandaloneReader select db failed")
+			}
+			if r.reconnectSource(r.dumpClient, reason) {
+				r.resendDumpSequence(dbId, key)
+				goto retryReceive
+			}
+			log.Panicf("scanStandaloneReader select db failed. db=[%d]", dbId)
 		}
 		iDump, err1 := r.dumpClient.Receive()
 		iPttl, err2 := r.dumpClient.Receive()
 		if len(r.opts.SkipUnknownType) > 0 {
 			iType, err3 := r.dumpClient.Receive()
 			if err3 != nil {
+				if r.reconnectSource(r.dumpClient, err3) {
+					r.resendDumpSequence(dbId, key)
+					goto retryReceive
+				}
 				log.Panicf(err3.Error())
 			}
 			typeStr := iType.(string)
@@ -331,8 +613,16 @@ func (r *scanStandaloneReader) restore() {
 		if errors.Is(err1, proto.Nil) {
 			continue // key not exist
 		} else if err1 != nil {
+			if r.reconnectSource(r.dumpClient, err1) {
+				r.resendDumpSequence(dbId, key)
+				goto retryReceive
+			}
 			log.Panicf(err1.Error())
 		} else if err2 != nil {
+			if r.reconnectSource(r.dumpClient, err2) {
+				r.resendDumpSequence(dbId, key)
+				goto retryReceive
+			}
 			log.Panicf(err2.Error())
 		}
 		dump := iDump.(string)
@@ -372,6 +662,7 @@ func (r *scanStandaloneReader) restore() {
 				e.Argv = []string{"PEXPIRE", key, strconv.Itoa(pttl)}
 				r.ch <- e
 			}
+			r.stat.SyncedKeyCount++
 		} else {
 			argv := []string{"RESTORE", key, strconv.Itoa(pttl), dump}
 			if config.Opt.Advanced.RDBRestoreCommandBehavior == "rewrite" {
@@ -381,6 +672,7 @@ func (r *scanStandaloneReader) restore() {
 				DbId: dbId,
 				Argv: argv,
 			}
+			r.stat.SyncedKeyCount++
 		}
 	}
 	log.Infof("[%s] scanStandaloneReader restore finished.", r.stat.Name)
@@ -392,12 +684,39 @@ func (r *scanStandaloneReader) Status() interface{} {
 }
 
 func (r *scanStandaloneReader) StatusString() string {
-	if r.stat.ScanFinished {
-		return fmt.Sprintf("need_update_count=[%d]", r.stat.NeedUpdateCount)
+	if !r.opts.Scan || r.stat.ScanFinished {
+		return fmt.Sprintf("synced_key_count=[%d], synced_key_ops=[%.2f], need_update_count=[%d]",
+			r.stat.SyncedKeyCount, r.stat.SyncedKeyOps, r.stat.NeedUpdateCount)
 	}
-	return fmt.Sprintf("scan_dbid=[%d], scan_percent=[%s], need_update_count=[%d]", r.stat.ScanDbId, r.stat.ScanPercentByDbId, r.stat.NeedUpdateCount)
+	return fmt.Sprintf("scan_dbid=[%d], scan_percent=[%s], synced_key_count=[%d], synced_key_ops=[%.2f], need_update_count=[%d]",
+		r.stat.ScanDbId, r.stat.ScanPercentByDbId, r.stat.SyncedKeyCount, r.stat.SyncedKeyOps, r.stat.NeedUpdateCount)
 }
 
 func (r *scanStandaloneReader) StatusConsistent() bool {
 	return r.stat.ScanFinished && r.stat.NeedUpdateCount == 0
+}
+
+func (r *scanStandaloneReader) updateSyncedKeyOPS() {
+	nowTS := float64(time.Now().UnixNano()) / 1e9
+	if r.stat.lastSyncedKeyUpdateTSSecond != 0 {
+		intervalSec := nowTS - r.stat.lastSyncedKeyUpdateTSSecond
+		if intervalSec > 0 {
+			r.stat.SyncedKeyOps = float64(r.stat.SyncedKeyCount-r.stat.lastSyncedKeyCount) / intervalSec
+		}
+	}
+	r.stat.lastSyncedKeyCount = r.stat.SyncedKeyCount
+	r.stat.lastSyncedKeyUpdateTSSecond = nowTS
+}
+
+func (r *scanStandaloneReader) runSyncedKeyOPSTicker() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-ticker.C:
+			r.updateSyncedKeyOPS()
+		}
+	}
 }

@@ -51,8 +51,12 @@ dbs = []                   # set you want to scan dbs such as [1,5,7], if you do
 scan = true                # set to false if you don't want to scan keys
 ksn = false                # set to true to enabled Redis keyspace notifications (KSN) subscription
 count = 1                  # number of keys to scan per iteration
-scan_max_queue_len = 0     # pause SCAN when the internal dump queue reaches this length, 0 disables backpressure
+scan_high_queue_len = 500000    # pause SCAN when the internal dump queue reaches this high watermark
+scan_low_queue_len = 0     # resume SCAN when the queue falls to or below this low watermark
 drop_ksn_on_backpressure = false # drop newly received KSN updates while scan backpressure is active
+sample_on_start = true     # 在开始同步前，对每个 DB 采样少量 key/value 并打印日志
+sample_count_per_db = 3    # 每个 DB 打印的采样 key 数量
+sample_value_max_len = 256 # 采样 value 预览的最大长度，超出会截断
 ```
 
 * `cluster`：源端是否为集群
@@ -66,5 +70,9 @@ drop_ksn_on_backpressure = false # drop newly received KSN updates while scan ba
 * `scan`：是否开启 SCAN 阶段，设置为 false 时，RedisShake 会跳过全量同步阶段
 * `ksn`：开启 `ksn` 参数后，RedisShake 会订阅源端的 Key 变化，实现增量同步
 * `count`：全量同步时每次从源端拉取的 key 的个数，默认为 1，改为较大值可以显著提升同步效率，同时也会提升源端压力。
-* `scan_max_queue_len`：仅对 SCAN 阶段生效。当内部待 DUMP 队列长度达到该阈值时，RedisShake 会暂停继续执行 SCAN；当队列长度回落到阈值以下后会自动恢复。`ksn` 订阅不受影响。设置为 `0` 表示关闭该背压机制。
-* `drop_ksn_on_backpressure`：仅在 `scan_max_queue_len > 0` 时生效。开启后，当 SCAN 背压触发时，新收到的 KSN 更新会被直接丢弃而不入队。该选项会牺牲增量完整性来限制队列增长，默认关闭。
+* `scan_high_queue_len`：仅对 SCAN 阶段生效。当内部待 DUMP 队列长度达到该高水位时，RedisShake 会暂停继续执行 SCAN。默认值为 `500000`。
+* `scan_low_queue_len`：仅对 SCAN 阶段生效。当 SCAN 因高水位被暂停后，只有当队列长度回落到该低水位及以下时才会恢复执行。未设置时默认与高水位相同。
+* `drop_ksn_on_backpressure`：仅在启用 SCAN 背压时生效。开启后，当 SCAN 背压触发时，新收到的 KSN 更新会被直接丢弃而不入队。该选项会牺牲增量完整性来限制队列增长，默认关闭。
+* `sample_on_start`：仅用于观测。开启后，RedisShake 会在正式同步前按 DB 采样少量 key，并打印 key、type 与 value 预览到日志。默认开启。
+* `sample_count_per_db`：每个 DB 要打印的采样 key 数量，默认 3。
+* `sample_value_max_len`：value 预览的最大字符数，超过后会截断，默认 256。

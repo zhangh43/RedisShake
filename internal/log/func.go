@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/go-stack/stack"
+	"github.com/rs/zerolog"
 )
 
 func Debugf(format string, args ...interface{}) {
@@ -33,6 +34,6 @@ func Panicf(format string, args ...interface{}) {
 		}
 		errMsg += fmt.Sprintf("\n\t\t\t%v -> %n()", frameStr, frame)
 	}
-	logger.Error().Msg(errMsg)
+	logger.WithLevel(zerolog.PanicLevel).Msg(errMsg)
 	os.Exit(1)
 }

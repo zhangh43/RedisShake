@@ -49,6 +49,10 @@ type AdvancedOptions struct {
 	LogMaxBackups int    `mapstructure:"log_max_backups" default:"3"`
 	LogCompress   bool   `mapstructure:"log_compress" default:"true"`
 
+	IOReconnect         bool `mapstructure:"io_reconnect" default:"true"`
+	IOReconnectMaxTimes int  `mapstructure:"io_reconnect_max_times" default:"10"`
+	IOReconnectDelayMs  int  `mapstructure:"io_reconnect_delay_ms" default:"1000"`
+
 	// redis-shake gets key and value from rdb file, and uses RESTORE command to
 	// create the key in target redis. Redis RESTORE will return a "Target key name
 	// is busy" error when key already exists. You can use this configuration item

@@ -48,8 +48,12 @@ dbs = []                   # set you want to scan dbs such as [1,5,7], if you do
 scan = true                # set to false if you don't want to scan keys
 ksn = false                # set to true to enabled Redis keyspace notifications (KSN) subscription
 count = 1                  # number of keys to scan per iteration
-scan_max_queue_len = 0     # pause SCAN when the internal dump queue reaches this length, 0 disables backpressure
+scan_high_queue_len = 500000    # pause SCAN when the internal dump queue reaches this high watermark
+scan_low_queue_len = 0     # resume SCAN when the queue falls to or below this low watermark
 drop_ksn_on_backpressure = false # drop newly received KSN updates while scan backpressure is active
+sample_on_start = true     # log a few sampled key/value previews for each DB before syncing starts
+sample_count_per_db = 3    # number of sampled keys to log per DB
+sample_value_max_len = 256 # truncate sampled value previews to this many characters
 ```
 
 * `cluster`: Whether the source is a cluster
@@ -63,5 +67,9 @@ drop_ksn_on_backpressure = false # drop newly received KSN updates while scan ba
 * `scan`: Whether to enable the SCAN stage. When set to false, RedisShake will skip the full synchronization stage
 * `ksn`: After enabling the `ksn` parameter, RedisShake will subscribe to Key changes at the source to achieve incremental synchronization
 * `count`: The number of keys fetched from the source each time during full synchronization. The default is 1. Changing to a larger value can significantly improve synchronization efficiency, but will also increase pressure on the source.
-* `scan_max_queue_len`: Only applies to the SCAN stage. When the internal pending DUMP queue reaches this threshold, RedisShake pauses further SCAN calls; scanning resumes automatically once the queue length falls below the threshold. `ksn` subscriptions are not affected. Set to `0` to disable this backpressure.
-* `drop_ksn_on_backpressure`: Only applies when `scan_max_queue_len > 0`. When enabled, newly received KSN updates are dropped instead of being enqueued while SCAN backpressure is active. This limits queue growth at the cost of incremental completeness. Disabled by default.
+* `scan_high_queue_len`: Only applies to the SCAN stage. RedisShake pauses further SCAN calls when the internal pending DUMP queue reaches this high watermark. The default is `500000`.
+* `scan_low_queue_len`: Only applies to the SCAN stage. Once SCAN is paused by the high watermark, it resumes only after the queue length falls to or below this low watermark. If unset, it defaults to the same value as the high watermark.
+* `drop_ksn_on_backpressure`: Only applies when SCAN backpressure is enabled. When enabled, newly received KSN updates are dropped instead of being enqueued while SCAN backpressure is active. This limits queue growth at the cost of incremental completeness. Disabled by default.
+* `sample_on_start`: Observability-only option. When enabled, RedisShake samples a few keys from each DB before syncing and logs the key, type, and value preview. Enabled by default.
+* `sample_count_per_db`: Number of sampled keys to log for each DB. Default is 3.
+* `sample_value_max_len`: Maximum number of characters kept in the sampled value preview before truncation. Default is 256.
