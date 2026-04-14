@@ -6,6 +6,7 @@ import (
 
 	"RedisShake/internal/config"
 	"RedisShake/internal/entry"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,6 +33,31 @@ func Test_redisStandaloneWriter_reconnectIO(t *testing.T) {
 
 	require.True(t, w.reconnectIO())
 	require.Equal(t, 2, attempts)
+}
+
+func Test_redisStandaloneWriter_reconnectIOContinuesBeyondMaxTimes(t *testing.T) {
+	orig := config.Opt.Advanced
+	defer func() {
+		config.Opt.Advanced = orig
+	}()
+
+	config.Opt.Advanced.IOReconnect = true
+	config.Opt.Advanced.IOReconnectMaxTimes = 2
+	config.Opt.Advanced.IOReconnectDelayMs = 0
+
+	attempts := 0
+	w := &redisStandaloneWriter{
+		reconnectFn: func() error {
+			attempts++
+			if attempts < 4 {
+				return errors.New("unexpected EOF")
+			}
+			return nil
+		},
+	}
+
+	require.True(t, w.reconnectIO())
+	require.Equal(t, 4, attempts)
 }
 
 func Test_redisStandaloneWriter_resetInflight(t *testing.T) {

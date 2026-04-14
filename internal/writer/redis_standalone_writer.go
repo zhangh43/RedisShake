@@ -67,10 +67,32 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 		return false
 	}
 	delay := time.Duration(config.Opt.Advanced.IOReconnectDelayMs) * time.Millisecond
-	for attempt := 1; attempt <= config.Opt.Advanced.IOReconnectMaxTimes; attempt++ {
+	maxTimes := config.Opt.Advanced.IOReconnectMaxTimes
+	if maxTimes <= 0 {
+		maxTimes = 1
+	}
+	for attempt := 1; ; attempt++ {
+		if w.ctx != nil {
+			select {
+			case <-w.ctx.Done():
+				return false
+			default:
+			}
+		}
+		roundAttempt := (attempt-1)%maxTimes + 1
 		log.Warnf("[%s] reconnecting target redis. attempt=[%d/%d], delay=[%s]",
-			w.stat.Name, attempt, config.Opt.Advanced.IOReconnectMaxTimes, delay)
-		time.Sleep(delay)
+			w.stat.Name, roundAttempt, maxTimes, delay)
+		if delay > 0 {
+			if w.ctx != nil {
+				select {
+				case <-w.ctx.Done():
+					return false
+				case <-time.After(delay):
+				}
+			} else {
+				time.Sleep(delay)
+			}
+		}
 		reconnectFn := w.reconnectFn
 		if reconnectFn == nil {
 			reconnectFn = w.client.Reconnect
@@ -85,8 +107,10 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 			log.Warnf("[%s] reconnected target redis. db=[%d]", w.stat.Name, w.DbId)
 			return true
 		}
+		if roundAttempt == maxTimes {
+			log.Warnf("[%s] target redis reconnect attempts exhausted. continuing to retry until context is canceled", w.stat.Name)
+		}
 	}
-	return false
 }
 
 func NewRedisStandaloneWriter(ctx context.Context, opts *RedisWriterOptions) Writer {

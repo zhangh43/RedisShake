@@ -10,6 +10,7 @@ import (
 
 	"RedisShake/internal/client"
 	"RedisShake/internal/config"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,6 +37,31 @@ func Test_scanStandaloneReader_reconnectSource(t *testing.T) {
 
 	require.True(t, r.reconnectSource(nil, errors.New("unexpected EOF")))
 	require.Equal(t, 2, attempts)
+}
+
+func Test_scanStandaloneReader_reconnectSourceContinuesBeyondMaxTimes(t *testing.T) {
+	orig := config.Opt.Advanced
+	defer func() {
+		config.Opt.Advanced = orig
+	}()
+
+	config.Opt.Advanced.IOReconnect = true
+	config.Opt.Advanced.IOReconnectMaxTimes = 2
+	config.Opt.Advanced.IOReconnectDelayMs = 0
+
+	attempts := 0
+	r := &scanStandaloneReader{
+		reconnectFn: func(_ *client.Redis) error {
+			attempts++
+			if attempts < 4 {
+				return errors.New("unexpected EOF")
+			}
+			return nil
+		},
+	}
+
+	require.True(t, r.reconnectSource(nil, errors.New("unexpected EOF")))
+	require.Equal(t, 4, attempts)
 }
 
 func Test_scanStandaloneReader_waitForScanQueueCapacity(t *testing.T) {

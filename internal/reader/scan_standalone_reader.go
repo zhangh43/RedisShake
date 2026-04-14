@@ -345,10 +345,32 @@ func (r *scanStandaloneReader) reconnectSource(c *client.Redis, reason error) bo
 		return false
 	}
 	delay := time.Duration(config.Opt.Advanced.IOReconnectDelayMs) * time.Millisecond
-	for attempt := 1; attempt <= config.Opt.Advanced.IOReconnectMaxTimes; attempt++ {
+	maxTimes := config.Opt.Advanced.IOReconnectMaxTimes
+	if maxTimes <= 0 {
+		maxTimes = 1
+	}
+	for attempt := 1; ; attempt++ {
+		if r.ctx != nil {
+			select {
+			case <-r.ctx.Done():
+				return false
+			default:
+			}
+		}
+		roundAttempt := (attempt-1)%maxTimes + 1
 		log.Warnf("[%s] reconnecting source redis. attempt=[%d/%d], delay=[%s], error=[%v]",
-			r.stat.Name, attempt, config.Opt.Advanced.IOReconnectMaxTimes, delay, reason)
-		time.Sleep(delay)
+			r.stat.Name, roundAttempt, maxTimes, delay, reason)
+		if delay > 0 {
+			if r.ctx != nil {
+				select {
+				case <-r.ctx.Done():
+					return false
+				case <-time.After(delay):
+				}
+			} else {
+				time.Sleep(delay)
+			}
+		}
 		reconnectFn := r.reconnectFn
 		if reconnectFn == nil {
 			reconnectFn = func(rc *client.Redis) error { return rc.Reconnect() }
@@ -357,8 +379,10 @@ func (r *scanStandaloneReader) reconnectSource(c *client.Redis, reason error) bo
 			log.Warnf("[%s] reconnected source redis", r.stat.Name)
 			return true
 		}
+		if roundAttempt == maxTimes {
+			log.Warnf("[%s] source redis reconnect attempts exhausted. continuing to retry until context is canceled", r.stat.Name)
+		}
 	}
-	return false
 }
 
 func (r *scanStandaloneReader) selectSourceDB(c *client.Redis, dbId int) {
@@ -416,23 +440,44 @@ func (r *scanStandaloneReader) subscribe() {
 	c := client.NewRedisClient(r.ctx, r.opts.Address, r.opts.Username, r.opts.Password, r.opts.Tls, r.opts.TlsConfig, r.opts.PreferReplica)
 	log.Infof("[%s] scanStandaloneReader subscribe started. dbs=[%v]", r.stat.Name, r.dbs)
 	subscribe := func() {
-		if len(r.dbs) == 0 {
-			c.Send("psubscribe", "__keyevent@*__:*")
-			_, err := c.Receive()
-			if err != nil {
+		for {
+			if len(r.dbs) == 0 {
+				if err := c.SendWithError("psubscribe", "__keyevent@*__:*"); err == nil {
+					if _, recvErr := c.Receive(); recvErr == nil {
+						return
+					} else if r.reconnectSource(c, recvErr) {
+						continue
+					} else {
+						log.Panicf(recvErr.Error())
+					}
+				} else if r.reconnectSource(c, err) {
+					continue
+				} else {
+					log.Panicf(err.Error())
+				}
+			}
+			args := []interface{}{"psubscribe"}
+			for _, db := range r.dbs {
+				args = append(args, fmt.Sprintf("__keyevent@%v__:*", db))
+			}
+			if err := c.SendWithError(args...); err != nil {
+				if r.reconnectSource(c, err) {
+					continue
+				}
 				log.Panicf(err.Error())
 			}
-			return
-		}
-		args := []interface{}{"psubscribe"}
-		for _, db := range r.dbs {
-			args = append(args, fmt.Sprintf("__keyevent@%v__:*", db))
-		}
-		c.Send(args...)
-		for range r.dbs {
-			_, err := c.Receive()
-			if err != nil {
-				log.Panicf(err.Error())
+			resubscribed := true
+			for range r.dbs {
+				if _, err := c.Receive(); err != nil {
+					if r.reconnectSource(c, err) {
+						resubscribed = false
+						break
+					}
+					log.Panicf(err.Error())
+				}
+			}
+			if resubscribed {
+				return
 			}
 		}
 	}
@@ -489,12 +534,16 @@ func (r *scanStandaloneReader) scan() {
 	defer c.Close()
 	dbs := r.dbs
 	if len(r.dbs) == 0 {
-		c.Send("info", "keyspace")
-		info, err := c.Receive()
-		if err != nil {
-			log.Panicf(err.Error())
+		for {
+			info, err := r.doSourceCommand(c, "info", "keyspace")
+			if err == nil {
+				dbs = utils.ParseDBs(info.(string))
+				break
+			}
+			if !r.reconnectSource(c, err) {
+				log.Panicf(err.Error())
+			}
 		}
-		dbs = utils.ParseDBs(info.(string))
 	}
 	for _, dbId := range dbs {
 		r.selectSourceDB(c, dbId)
