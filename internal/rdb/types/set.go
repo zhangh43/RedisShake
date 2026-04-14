@@ -42,22 +42,55 @@ func (o *SetObject) Rewrite() <-chan RedisCmd {
 func (o *SetObject) readSet() {
 	rd := o.rd
 	size := int(structure.ReadLength(rd))
+	batchSize := getRewriteCollectionBatchSize()
+	batch := make([]string, 0, batchSize)
+	flush := func() {
+		o.emitSAddBatch(batch)
+		batch = batch[:0]
+	}
 	for i := 0; i < size; i++ {
 		val := structure.ReadString(rd)
-		o.cmdC <- RedisCmd{"sadd", o.key, val}
+		batch = append(batch, val)
+		if len(batch) >= batchSize {
+			flush()
+		}
+	}
+	if len(batch) > 0 {
+		flush()
 	}
 }
 
 func (o *SetObject) readIntset() {
 	elements := structure.ReadIntset(o.rd)
-	for _, ele := range elements {
-		o.cmdC <- RedisCmd{"sadd", o.key, ele}
+	batchSize := getRewriteCollectionBatchSize()
+	for i := 0; i < len(elements); i += batchSize {
+		end := i + batchSize
+		if end > len(elements) {
+			end = len(elements)
+		}
+		o.emitSAddBatch(elements[i:end])
 	}
 }
 
 func (o *SetObject) readListpack() {
 	elements := structure.ReadListpack(o.rd)
-	for _, ele := range elements {
-		o.cmdC <- RedisCmd{"sadd", o.key, ele}
+	batchSize := getRewriteCollectionBatchSize()
+	for i := 0; i < len(elements); i += batchSize {
+		end := i + batchSize
+		if end > len(elements) {
+			end = len(elements)
+		}
+		o.emitSAddBatch(elements[i:end])
 	}
+}
+
+func (o *SetObject) emitSAddBatch(elements []string) {
+	if len(elements) == 0 {
+		return
+	}
+	cmd := make(RedisCmd, 2+len(elements))
+	cmd[0] = "sadd"
+	cmd[1] = o.key
+	copy(cmd[2:], elements)
+	o.cmdC <- cmd
 }

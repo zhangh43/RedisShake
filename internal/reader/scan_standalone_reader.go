@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"RedisShake/internal/client"
@@ -64,7 +65,7 @@ type scanStandaloneReader struct {
 	reconnectFn     func(*client.Redis) error
 	isValkey        bool
 	ksnDropLogged   bool
-	scanPaused      bool
+	scanPaused      atomic.Bool
 
 	stat struct {
 		Name              string  `json:"name"`
@@ -123,23 +124,23 @@ func (r *scanStandaloneReader) waitForScanQueueCapacity(dbId int) bool {
 		low = high
 	}
 
-	if !r.scanPaused && r.getQueueLen() >= high {
+	if !r.scanPaused.Load() && r.getQueueLen() >= high {
 		log.Warnf("[%s] scan backpressure activated. queue_len=[%d], scan_high_queue_len=[%d], scan_low_queue_len=[%d], db=[%d]",
 			r.stat.Name, r.getQueueLen(), high, low, dbId)
-		r.scanPaused = true
+		r.scanPaused.Store(true)
 	}
 
-	for r.scanPaused && r.getQueueLen() > low {
+	for r.scanPaused.Load() && r.getQueueLen() > low {
 		select {
 		case <-r.ctx.Done():
 			return false
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	if r.scanPaused {
+	if r.scanPaused.Load() {
 		log.Warnf("[%s] scan backpressure released. queue_len=[%d], scan_high_queue_len=[%d], scan_low_queue_len=[%d], db=[%d]",
 			r.stat.Name, r.getQueueLen(), high, low, dbId)
-		r.scanPaused = false
+		r.scanPaused.Store(false)
 	}
 	return true
 }
@@ -151,7 +152,7 @@ func (r *scanStandaloneReader) shouldDropKSNOnBackpressure() bool {
 	if r.getScanHighQueueLen() <= 0 {
 		return false
 	}
-	return r.scanPaused || r.getQueueLen() >= r.getScanHighQueueLen()
+	return r.scanPaused.Load() || r.getQueueLen() >= r.getScanHighQueueLen()
 }
 
 func (r *scanStandaloneReader) logKSNDropState(active bool) {

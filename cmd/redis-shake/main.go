@@ -56,6 +56,7 @@ func main() {
 		config.Opt.Advanced.LogMaxAge,
 		config.Opt.Advanced.LogMaxBackups,
 		config.Opt.Advanced.LogCompress)
+	logAdvancedFeatureConfig()
 	utils.ChdirAndAcquireFileLock()
 	utils.SetNcpu()
 	utils.SetPprofPort()
@@ -115,6 +116,12 @@ func main() {
 			log.Infof("* tls: %v", opts.Tls)
 			theReader = reader.NewScanStandaloneReader(ctx, opts)
 		}
+		log.Infof("scan_reader option: scan=[%v], ksn=[%v], count=[%d], dbs=[%v], prefer_replica=[%v]",
+			opts.Scan, opts.KSN, opts.Count, opts.DBS, opts.PreferReplica)
+		log.Infof("scan_reader option: scan_high_queue_len=[%d], scan_low_queue_len=[%d], drop_ksn_on_backpressure=[%v]",
+			opts.ScanHighQueueLen, opts.ScanLowQueueLen, opts.DropKSNOnBackpressure)
+		log.Infof("scan_reader option: sample_on_start=[%v], sample_count_per_db=[%d], sample_value_max_len=[%d]",
+			opts.SampleOnStart, opts.SampleCountPerDB, opts.SampleValueMaxLen)
 	case v.IsSet("rdb_reader"):
 		opts := new(reader.RdbReaderOptions)
 		defaults.SetDefaults(opts)
@@ -287,6 +294,19 @@ Loop:
 	theWriter.Close()       // Wait for all writing operations to complete
 	utils.ReleaseFileLock() // Release file lock
 	log.Infof("all done")
+}
+
+func logAdvancedFeatureConfig() {
+	log.Infof("advanced option: io_reconnect=[%v], io_reconnect_max_times=[%d], io_reconnect_delay_ms=[%d]",
+		config.Opt.Advanced.IOReconnect, config.Opt.Advanced.IOReconnectMaxTimes, config.Opt.Advanced.IOReconnectDelayMs)
+	log.Infof("advanced option: target_redis_oom_requeue=[%v], target_redis_oom_requeue_max_times=[%d], target_redis_oom_requeue_delay_ms=[%d]",
+		config.Opt.Advanced.TargetRedisOOMRequeue, config.Opt.Advanced.TargetRedisOOMRequeueMaxTimes, config.Opt.Advanced.TargetRedisOOMRequeueDelayMs)
+	log.Infof("advanced option: rewrite_collection_batch_size=[%d]",
+		config.Opt.Advanced.RewriteCollectionBatchSize)
+	log.Infof("advanced option: target_redis_writer_shards=[%d] (0 means auto)",
+		config.Opt.Advanced.TargetRedisWriterShards)
+	log.Infof("advanced option: target_redis_proto_max_bulk_len=[%d]",
+		config.Opt.Advanced.TargetRedisProtoMaxBulkLen)
 }
 
 func waitShutdown(cancel context.CancelFunc) {

@@ -160,6 +160,15 @@ target_redis_oom_requeue = false
 target_redis_oom_requeue_max_times = 3
 target_redis_oom_requeue_delay_ms = 500
 
+# Batch size for rewrite fallback commands on collection types (list/set/zset/hash).
+# Effective when target_redis_proto_max_bulk_len is hit and RESTORE falls back to RESP commands.
+# Keep default unless you have high RTT and large collections.
+rewrite_collection_batch_size = 128
+
+# Number of writer shards for standalone redis_writer.
+# 0 means auto-select based on ncpu/pipeline/qps.
+target_redis_writer_shards = 0
+
 # This setting corresponds to the 'client-query-buffer-limit' in Redis configuration.
 # The default value is typically 1GB.
 # It's recommended not to modify this value unless absolutely necessary.

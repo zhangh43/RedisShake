@@ -63,10 +63,22 @@ func (o *HashObject) Rewrite() <-chan RedisCmd {
 func (o *HashObject) readHash() {
 	rd := o.rd
 	size := int(structure.ReadLength(rd))
+	batchSize := getRewriteCollectionBatchSize()
+	pairs := make([]string, 0, batchSize*2)
+	flush := func() {
+		o.emitHSetBatch(pairs)
+		pairs = pairs[:0]
+	}
 	for i := 0; i < size; i++ {
 		key := structure.ReadString(rd)
 		value := structure.ReadString(rd)
-		o.cmdC <- RedisCmd{"hset", o.key, key, value}
+		pairs = append(pairs, key, value)
+		if len(pairs) >= batchSize*2 {
+			flush()
+		}
+	}
+	if len(pairs) > 0 {
+		flush()
 	}
 }
 
@@ -78,10 +90,13 @@ func (o *HashObject) readHashZiplist() {
 	rd := o.rd
 	list := structure.ReadZipList(rd)
 	size := len(list)
-	for i := 0; i < size; i += 2 {
-		key := list[i]
-		value := list[i+1]
-		o.cmdC <- RedisCmd{"hset", o.key, key, value}
+	batchSize := getRewriteCollectionBatchSize()
+	for i := 0; i < size; i += batchSize * 2 {
+		end := i + batchSize*2
+		if end > size {
+			end = size
+		}
+		o.emitHSetBatch(list[i:end])
 	}
 }
 
@@ -89,10 +104,13 @@ func (o *HashObject) readHashListpack() {
 	rd := o.rd
 	list := structure.ReadListpack(rd)
 	size := len(list)
-	for i := 0; i < size; i += 2 {
-		key := list[i]
-		value := list[i+1]
-		o.cmdC <- RedisCmd{"hset", o.key, key, value}
+	batchSize := getRewriteCollectionBatchSize()
+	for i := 0; i < size; i += batchSize * 2 {
+		end := i + batchSize*2
+		if end > size {
+			end = size
+		}
+		o.emitHSetBatch(list[i:end])
 	}
 }
 
@@ -164,4 +182,15 @@ func (o *HashObject) readHashTtl(isPre bool){
 		}
 	}
 
+}
+
+func (o *HashObject) emitHSetBatch(fieldsAndValues []string) {
+	if len(fieldsAndValues) == 0 {
+		return
+	}
+	cmd := make(RedisCmd, 2+len(fieldsAndValues))
+	cmd[0] = "hset"
+	cmd[1] = o.key
+	copy(cmd[2:], fieldsAndValues)
+	o.cmdC <- cmd
 }

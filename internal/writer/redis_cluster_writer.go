@@ -60,16 +60,9 @@ func (r *RedisClusterWriter) loadClusterNodes(ctx context.Context, opts *RedisWr
 }
 
 func (r *RedisClusterWriter) StartWrite(ctx context.Context) chan *entry.Entry {
-	chs := make(map[string]chan *entry.Entry, len(r.writers))
 	for _, w := range r.writers {
-		stat := w.Status().(struct {
-			Name              string `json:"name"`
-			UnansweredBytes   int64  `json:"unanswered_bytes"`
-			UnansweredEntries int64  `json:"unanswered_entries"`
-		})
-		chs[stat.Name] = w.StartWrite(ctx)
+		w.StartWrite(ctx)
 	}
-
 	return nil
 }
 

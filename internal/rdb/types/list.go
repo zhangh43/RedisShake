@@ -50,47 +50,101 @@ func (o *ListObject) Rewrite() <-chan RedisCmd {
 func (o *ListObject) readList() {
 	rd := o.rd
 	size := int(structure.ReadLength(rd))
+	batchSize := getRewriteCollectionBatchSize()
+	batch := make([]string, 0, batchSize)
+	flush := func() {
+		o.emitRPushBatch(batch)
+		batch = batch[:0]
+	}
 	for i := 0; i < size; i++ {
 		ele := structure.ReadString(rd)
-		o.cmdC <- RedisCmd{"rpush", o.key, ele}
+		batch = append(batch, ele)
+		if len(batch) >= batchSize {
+			flush()
+		}
+	}
+	if len(batch) > 0 {
+		flush()
 	}
 }
 
 func (o *ListObject) readZipList() {
 	rd := o.rd
 	elements := structure.ReadZipList(rd)
-	for _, ele := range elements {
-		o.cmdC <- RedisCmd{"rpush", o.key, ele}
+	batchSize := getRewriteCollectionBatchSize()
+	for i := 0; i < len(elements); i += batchSize {
+		end := i + batchSize
+		if end > len(elements) {
+			end = len(elements)
+		}
+		o.emitRPushBatch(elements[i:end])
 	}
 }
 
 func (o *ListObject) readQuickList() {
 	rd := o.rd
 	size := int(structure.ReadLength(rd))
+	batchSize := getRewriteCollectionBatchSize()
+	batch := make([]string, 0, batchSize)
+	flush := func() {
+		o.emitRPushBatch(batch)
+		batch = batch[:0]
+	}
 	for i := 0; i < size; i++ {
 		ziplistElements := structure.ReadZipList(rd)
 		for _, ele := range ziplistElements {
-			o.cmdC <- RedisCmd{"rpush", o.key, ele}
+			batch = append(batch, ele)
+			if len(batch) >= batchSize {
+				flush()
+			}
 		}
+	}
+	if len(batch) > 0 {
+		flush()
 	}
 }
 
 func (o *ListObject) readQuickList2() {
 	rd := o.rd
-	cmdC := o.cmdC
 	size := int(structure.ReadLength(rd))
+	batchSize := getRewriteCollectionBatchSize()
+	batch := make([]string, 0, batchSize)
+	flush := func() {
+		o.emitRPushBatch(batch)
+		batch = batch[:0]
+	}
 	for i := 0; i < size; i++ {
 		container := structure.ReadLength(rd)
 		if container == quicklistNodeContainerPlain {
 			ele := structure.ReadString(rd)
-			cmdC <- RedisCmd{"rpush", o.key, ele}
+			batch = append(batch, ele)
+			if len(batch) >= batchSize {
+				flush()
+			}
 		} else if container == quicklistNodeContainerPacked {
 			listpackElements := structure.ReadListpack(rd)
 			for _, ele := range listpackElements {
-				cmdC <- RedisCmd{"rpush", o.key, ele}
+				batch = append(batch, ele)
+				if len(batch) >= batchSize {
+					flush()
+				}
 			}
 		} else {
 			log.Panicf("unknown quicklist container %d", container)
 		}
 	}
+	if len(batch) > 0 {
+		flush()
+	}
+}
+
+func (o *ListObject) emitRPushBatch(elements []string) {
+	if len(elements) == 0 {
+		return
+	}
+	cmd := make(RedisCmd, 2+len(elements))
+	cmd[0] = "rpush"
+	cmd[1] = o.key
+	copy(cmd[2:], elements)
+	o.cmdC <- cmd
 }

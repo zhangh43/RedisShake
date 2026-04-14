@@ -22,7 +22,7 @@ func testOne(t *testing.T, typeByte byte, setData string, values []string) {
 		if cmd[0] == "del" {
 			continue
 		}
-		elements = append(elements, cmd[2])
+		elements = append(elements, cmd[2:]...)
 	}
 	if len(elements) != len(values) {
 		t.Errorf("elements not match. len(o.elements)=[%d], len(values)=[%d]", len(elements), len(values))

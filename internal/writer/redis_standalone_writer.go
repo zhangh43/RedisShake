@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"go.uber.org/ratelimit"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.uber.org/ratelimit"
 
 	"RedisShake/internal/client"
 	"RedisShake/internal/client/proto"
@@ -44,6 +45,10 @@ type redisStandaloneWriter struct {
 	replyEpoch  uint64
 	pendingMu   sync.Mutex
 	pending     []*entry.Entry
+	replayMu    sync.Mutex
+	replayQueue []*entry.Entry
+	maxQPS      int
+	pipeLimit   uint64
 
 	stat struct {
 		Name              string `json:"name"`
@@ -85,17 +90,36 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 }
 
 func NewRedisStandaloneWriter(ctx context.Context, opts *RedisWriterOptions) Writer {
+	shards := resolveStandaloneWriterShards()
+	log.Infof("redis_writer effective option: cluster=[%v], address=[%s], target_redis_writer_shards=[%d], resolved_writer_shards=[%d]",
+		opts.Cluster, opts.Address, config.Opt.Advanced.TargetRedisWriterShards, shards)
+	if shards > 1 {
+		return newRedisShardedStandaloneWriter(ctx, opts, shards)
+	}
+	return newRedisStandaloneWriterWithLimits(ctx, opts, config.Opt.Advanced.TargetRedisMaxQPS, config.Opt.Advanced.PipelineCountLimit)
+}
+
+func newRedisStandaloneWriterWithLimits(ctx context.Context, opts *RedisWriterOptions, maxQPS int, pipeLimit uint64) *redisStandaloneWriter {
+	if maxQPS <= 0 {
+		maxQPS = config.Opt.Advanced.TargetRedisMaxQPS
+	}
+	if pipeLimit == 0 {
+		pipeLimit = config.Opt.Advanced.PipelineCountLimit
+	}
 	rw := new(redisStandaloneWriter)
 	rw.address = opts.Address
 	rw.stat.Name = "writer_" + strings.Replace(opts.Address, ":", "_", -1)
 	rw.client = client.NewRedisClient(ctx, opts.Address, opts.Username, opts.Password, opts.Tls, opts.TlsConfig, false)
-	rw.ch = make(chan *entry.Entry, config.Opt.Advanced.PipelineCountLimit)
+	rw.maxQPS = maxQPS
+	rw.pipeLimit = pipeLimit
+	pipeCap := int(rw.pipeLimit)
+	rw.ch = make(chan *entry.Entry, pipeCap)
 	if opts.OffReply {
 		log.Infof("turn off the reply of write")
 		rw.offReply = true
 		rw.client.Send("CLIENT", "REPLY", "OFF")
 	} else {
-		rw.chWaitReply = make(chan *replyItem, config.Opt.Advanced.PipelineCountLimit*2)
+		rw.chWaitReply = make(chan *replyItem, pipeCap*2)
 		rw.chWaitWg.Add(1)
 		go rw.processReply()
 	}
@@ -156,9 +180,31 @@ func (w *redisStandaloneWriter) resetInflight() []*entry.Entry {
 }
 
 func (w *redisStandaloneWriter) replayInflight() {
-	for _, e := range w.resetInflight() {
-		w.Write(e)
+	entries := w.resetInflight()
+	if len(entries) == 0 {
+		return
 	}
+	w.enqueueReplay(entries)
+}
+
+func (w *redisStandaloneWriter) enqueueReplay(entries []*entry.Entry) {
+	if len(entries) == 0 {
+		return
+	}
+	w.replayMu.Lock()
+	w.replayQueue = append(w.replayQueue, entries...)
+	w.replayMu.Unlock()
+}
+
+func (w *redisStandaloneWriter) nextReplay() *entry.Entry {
+	w.replayMu.Lock()
+	defer w.replayMu.Unlock()
+	if len(w.replayQueue) == 0 {
+		return nil
+	}
+	e := w.replayQueue[0]
+	w.replayQueue = w.replayQueue[1:]
+	return e
 }
 
 func (w *redisStandaloneWriter) switchDbTo(newDbId int) {
@@ -181,9 +227,16 @@ func (w *redisStandaloneWriter) processWrite(ctx context.Context) {
 	defer ticker.Stop()
 
 	var rl ratelimit.Limiter = nil
-	rl = ratelimit.New(config.Opt.Advanced.TargetRedisMaxQPS)
-	log.Infof("set target redis max qps to %d", config.Opt.Advanced.TargetRedisMaxQPS)
+	rl = ratelimit.New(w.maxQPS)
+	log.Infof("set target redis max qps to %d", w.maxQPS)
+
 	for {
+		if replayEntry := w.nextReplay(); replayEntry != nil {
+			if w.processEntry(rl, replayEntry) {
+				continue
+			}
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			// do nothing until w.ch is closed
@@ -202,38 +255,52 @@ func (w *redisStandaloneWriter) processWrite(ctx context.Context) {
 				w.chWg.Done()
 				return
 			}
-			// switch db if we need
-			if w.DbId != e.DbId {
-				w.switchDbTo(e.DbId)
-			}
-			// send
-			bytes := e.Serialize()
-			for e.SerializedSize+atomic.LoadInt64(&w.stat.UnansweredBytes) > config.Opt.Advanced.TargetRedisClientMaxQuerybufLen {
-				time.Sleep(1 * time.Nanosecond)
-			}
-			rl.Take()
-			log.Debugf("[%s] send cmd. cmd=[%s]", w.stat.Name, e.String())
-			if !w.offReply {
-				w.addPending(e)
-				item := &replyItem{entry: e, epoch: atomic.LoadUint64(&w.replyEpoch)}
-				select {
-				case w.chWaitReply <- item:
-				default:
-					w.client.Flush()
-					w.chWaitReply <- item
-				}
-				atomic.AddInt64(&w.stat.UnansweredBytes, e.SerializedSize)
-				atomic.AddInt64(&w.stat.UnansweredEntries, 1)
-			}
-			if err := w.client.SendBytesBuffWithError(bytes); err != nil {
-				if client.IsReconnectableIOError(err) && w.reconnectIO() {
-					w.replayInflight()
-					continue
-				}
-				log.Panicf("[%s] send failed. cmd=[%s], error=[%v]", w.stat.Name, e.String(), err)
+			if w.processEntry(rl, e) {
+				continue
 			}
 		}
 	}
+}
+
+// processEntry returns true when caller should continue outer write loop immediately.
+func (w *redisStandaloneWriter) processEntry(rl ratelimit.Limiter, e *entry.Entry) bool {
+	// switch db if we need
+	if w.DbId != e.DbId {
+		w.switchDbTo(e.DbId)
+	}
+	// send
+	bytes := e.Serialize()
+	for e.SerializedSize+atomic.LoadInt64(&w.stat.UnansweredBytes) > config.Opt.Advanced.TargetRedisClientMaxQuerybufLen {
+		time.Sleep(1 * time.Nanosecond)
+	}
+	rl.Take()
+	log.Debugf("[%s] send cmd. cmd=[%s]", w.stat.Name, e.String())
+	if !w.offReply {
+		w.addPending(e)
+		item := &replyItem{entry: e, epoch: atomic.LoadUint64(&w.replyEpoch)}
+		select {
+		case w.chWaitReply <- item:
+		default:
+			if err := w.client.FlushWithError(); err != nil {
+				if client.IsReconnectableIOError(err) && w.reconnectIO() {
+					w.replayInflight()
+					return true
+				}
+				log.Panicf("[%s] flush failed. error=[%v]", w.stat.Name, err)
+			}
+			w.chWaitReply <- item
+		}
+		atomic.AddInt64(&w.stat.UnansweredBytes, e.SerializedSize)
+		atomic.AddInt64(&w.stat.UnansweredEntries, 1)
+	}
+	if err := w.client.SendBytesBuffWithError(bytes); err != nil {
+		if client.IsReconnectableIOError(err) && w.reconnectIO() {
+			w.replayInflight()
+			return true
+		}
+		log.Panicf("[%s] send failed. cmd=[%s], error=[%v]", w.stat.Name, e.String(), err)
+	}
+	return false
 }
 
 func (w *redisStandaloneWriter) processReply() {

@@ -45,20 +45,44 @@ func (o *ZsetObject) Rewrite() <-chan RedisCmd {
 func (o *ZsetObject) readZset() {
 	rd := o.rd
 	size := int(structure.ReadLength(rd))
+	batchSize := getRewriteCollectionBatchSize()
+	pairs := make([]string, 0, batchSize*2)
+	flush := func() {
+		o.emitZAddBatch(pairs)
+		pairs = pairs[:0]
+	}
 	for i := 0; i < size; i++ {
 		member := structure.ReadString(rd)
 		score := structure.ReadFloat(rd)
-		o.cmdC <- RedisCmd{"zadd", o.key, fmt.Sprintf("%.17g", score), member}
+		pairs = append(pairs, fmt.Sprintf("%.17g", score), member)
+		if len(pairs) >= batchSize*2 {
+			flush()
+		}
+	}
+	if len(pairs) > 0 {
+		flush()
 	}
 }
 
 func (o *ZsetObject) readZset2() {
 	rd := o.rd
 	size := int(structure.ReadLength(rd))
+	batchSize := getRewriteCollectionBatchSize()
+	pairs := make([]string, 0, batchSize*2)
+	flush := func() {
+		o.emitZAddBatch(pairs)
+		pairs = pairs[:0]
+	}
 	for i := 0; i < size; i++ {
 		member := structure.ReadString(rd)
 		score := structure.ReadDouble(rd)
-		o.cmdC <- RedisCmd{"zadd", o.key, fmt.Sprintf("%.17g", score), member}
+		pairs = append(pairs, fmt.Sprintf("%.17g", score), member)
+		if len(pairs) >= batchSize*2 {
+			flush()
+		}
+	}
+	if len(pairs) > 0 {
+		flush()
 	}
 }
 
@@ -69,10 +93,17 @@ func (o *ZsetObject) readZsetZiplist() {
 	if size%2 != 0 {
 		log.Panicf("zset listpack size is not even. size=[%d]", size)
 	}
-	for i := 0; i < size; i += 2 {
-		member := list[i]
-		score := list[i+1]
-		o.cmdC <- RedisCmd{"zadd", o.key, score, member}
+	batchSize := getRewriteCollectionBatchSize()
+	for i := 0; i < size; i += batchSize * 2 {
+		end := i + batchSize*2
+		if end > size {
+			end = size
+		}
+		pairs := make([]string, 0, end-i)
+		for j := i; j < end; j += 2 {
+			pairs = append(pairs, list[j+1], list[j])
+		}
+		o.emitZAddBatch(pairs)
 	}
 }
 
@@ -83,9 +114,27 @@ func (o *ZsetObject) readZsetListpack() {
 	if size%2 != 0 {
 		log.Panicf("zset listpack size is not even. size=[%d]", size)
 	}
-	for i := 0; i < size; i += 2 {
-		member := list[i]
-		score := list[i+1]
-		o.cmdC <- RedisCmd{"zadd", o.key, score, member}
+	batchSize := getRewriteCollectionBatchSize()
+	for i := 0; i < size; i += batchSize * 2 {
+		end := i + batchSize*2
+		if end > size {
+			end = size
+		}
+		pairs := make([]string, 0, end-i)
+		for j := i; j < end; j += 2 {
+			pairs = append(pairs, list[j+1], list[j])
+		}
+		o.emitZAddBatch(pairs)
 	}
+}
+
+func (o *ZsetObject) emitZAddBatch(scoreMembers []string) {
+	if len(scoreMembers) == 0 {
+		return
+	}
+	cmd := make(RedisCmd, 2+len(scoreMembers))
+	cmd[0] = "zadd"
+	cmd[1] = o.key
+	copy(cmd[2:], scoreMembers)
+	o.cmdC <- cmd
 }

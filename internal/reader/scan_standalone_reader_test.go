@@ -68,7 +68,7 @@ func Test_scanStandaloneReader_waitForScanQueueCapacity(t *testing.T) {
 	select {
 	case ok := <-done:
 		require.True(t, ok)
-		require.False(t, r.scanPaused)
+		require.False(t, r.scanPaused.Load())
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("waitForScanQueueCapacity did not resume after queue length dropped below threshold")
 	}
@@ -115,7 +115,7 @@ func Test_scanStandaloneReader_waitForScanQueueCapacity_HighLowWatermark(t *test
 	case <-done:
 		t.Fatal("waitForScanQueueCapacity returned before queue length dropped below low watermark")
 	case <-time.After(50 * time.Millisecond):
-		require.True(t, r.scanPaused)
+		require.True(t, r.scanPaused.Load())
 	}
 
 	queueLen.Store(6)
@@ -129,7 +129,7 @@ func Test_scanStandaloneReader_waitForScanQueueCapacity_HighLowWatermark(t *test
 	select {
 	case ok := <-done:
 		require.True(t, ok)
-		require.False(t, r.scanPaused)
+		require.False(t, r.scanPaused.Load())
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("waitForScanQueueCapacity did not resume after queue length dropped to low watermark")
 	}
@@ -156,11 +156,11 @@ func Test_scanStandaloneReader_shouldDropKSNOnBackpressure(t *testing.T) {
 			ScanLowQueueLen:       5,
 			DropKSNOnBackpressure: true,
 		},
-		scanPaused: true,
 		queueLen: func() int {
 			return 6
 		},
 	}
+	r.scanPaused.Store(true)
 
 	require.True(t, r.shouldDropKSNOnBackpressure())
 }
