@@ -79,3 +79,15 @@ func IsReconnectableIOError(err error) bool {
 		strings.Contains(msg, "i/o timeout") ||
 		strings.Contains(msg, "timeout")
 }
+
+func IsRetryableRedisStateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "cluster is shutting down") ||
+		strings.Contains(msg, "clusterdown") ||
+		strings.Contains(msg, "tryagain") ||
+		strings.Contains(msg, "loading") ||
+		strings.Contains(msg, "masterdown")
+}

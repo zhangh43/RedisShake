@@ -147,3 +147,22 @@ func TestIsReconnectableIOError(t *testing.T) {
 		}
 	}
 }
+
+func TestIsRetryableRedisStateError(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{errors.New("ERR cluster is shutting down"), true},
+		{errors.New("CLUSTERDOWN The cluster is down"), true},
+		{errors.New("TRYAGAIN Multiple keys request during rehashing of slot"), true},
+		{errors.New("LOADING Redis is loading the dataset in memory"), true},
+		{errors.New("MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'"), true},
+		{errors.New("ERR unknown command"), false},
+	}
+	for _, tc := range cases {
+		if got := IsRetryableRedisStateError(tc.err); got != tc.want {
+			t.Fatalf("IsRetryableRedisStateError(%v)=%v want %v", tc.err, got, tc.want)
+		}
+	}
+}

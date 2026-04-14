@@ -39,6 +39,14 @@ type TlsConfig struct {
 }
 
 func NewRedisClient(ctx context.Context, address string, username string, password string, Tls bool, tlsConfig TlsConfig, replica bool) *Redis {
+	r, err := NewRedisClientWithError(ctx, address, username, password, Tls, tlsConfig, replica)
+	if err != nil {
+		log.Panicf("dial failed. address=[%s], tls=[%v], err=[%v]", address, Tls, err)
+	}
+	return r
+}
+
+func NewRedisClientWithError(ctx context.Context, address string, username string, password string, Tls bool, tlsConfig TlsConfig, replica bool) (*Redis, error) {
 	r := new(Redis)
 	r.ctx = ctx
 	r.address = address
@@ -49,9 +57,9 @@ func NewRedisClient(ctx context.Context, address string, username string, passwo
 	r.replica = replica
 	err := r.connect()
 	if err != nil {
-		log.Panicf("dial failed. address=[%s], tls=[%v], err=[%v]", address, Tls, err)
+		return nil, err
 	}
-	return r
+	return r, nil
 }
 
 func (r *Redis) connect() error {

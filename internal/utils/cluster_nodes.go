@@ -2,17 +2,65 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"RedisShake/internal/client"
+	"RedisShake/internal/config"
 	"RedisShake/internal/log"
 )
 
 func GetRedisClusterNodes(ctx context.Context, address string, username string, password string, Tls bool, tlsConfig client.TlsConfig, perferReplica bool) (addresses []string, slots [][]int) {
-	c := client.NewRedisClient(ctx, address, username, password, Tls, tlsConfig, false)
-	reply := c.DoWithStringReply("cluster", "nodes")
+	maxTimes := config.Opt.Advanced.IOReconnectMaxTimes
+	if maxTimes <= 0 {
+		maxTimes = 1
+	}
+	delay := time.Duration(config.Opt.Advanced.IOReconnectDelayMs) * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		select {
+		case <-ctx.Done():
+			log.Panicf("get redis cluster nodes canceled. address=[%s]", address)
+		default:
+		}
+
+		nodes, nodeSlots, err := getRedisClusterNodesOnce(ctx, address, username, password, Tls, tlsConfig, perferReplica)
+		if err == nil {
+			return nodes, nodeSlots
+		}
+		if !config.Opt.Advanced.IOReconnect || (!client.IsReconnectableIOError(err) && !client.IsRetryableRedisStateError(err)) {
+			log.Panicf("get redis cluster nodes failed. address=[%s], err=[%v]", address, err)
+		}
+
+		roundAttempt := (attempt-1)%maxTimes + 1
+		log.Warnf("reconnecting target cluster metadata. address=[%s], attempt=[%d/%d], delay=[%s], err=[%v]",
+			address, roundAttempt, maxTimes, delay, err)
+		if roundAttempt == maxTimes {
+			log.Warnf("target cluster metadata reconnect attempts exhausted. continuing to retry until context is canceled. address=[%s]", address)
+		}
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				log.Panicf("get redis cluster nodes canceled. address=[%s]", address)
+			case <-time.After(delay):
+			}
+		}
+	}
+}
+
+func getRedisClusterNodesOnce(ctx context.Context, address string, username string, password string, Tls bool, tlsConfig client.TlsConfig, perferReplica bool) (addresses []string, slots [][]int, err error) {
+	c, err := client.NewRedisClientWithError(ctx, address, username, password, Tls, tlsConfig, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer c.Close()
+
+	reply, err := c.DoWithStringReplyWithError("cluster", "nodes")
+	if err != nil {
+		return nil, nil, err
+	}
 	reply = strings.TrimSpace(reply)
 	slotsCount := 0
 	// map of master's nodeId to address
@@ -27,7 +75,7 @@ func GetRedisClusterNodes(ctx context.Context, address string, username string, 
 		words := strings.Split(line, " ")
 		isMaster := strings.Contains(words[2], "master")
 		if len(words) < 8 {
-			log.Panicf("invalid cluster nodes line: %s", line)
+			return nil, nil, errors.New("invalid cluster nodes line: " + line)
 		}
 
 		// address
@@ -83,16 +131,16 @@ func GetRedisClusterNodes(ctx context.Context, address string, username string, 
 				seg := strings.Split(words[i], "-")
 				start, err = strconv.Atoi(seg[0])
 				if err != nil {
-					log.Panicf(err.Error())
+					return nil, nil, err
 				}
 				end, err = strconv.Atoi(seg[1])
 				if err != nil {
-					log.Panicf(err.Error())
+					return nil, nil, err
 				}
 			} else {
 				start, err = strconv.Atoi(words[i])
 				if err != nil {
-					log.Panicf(err.Error())
+					return nil, nil, err
 				}
 				end = start
 			}
@@ -105,7 +153,7 @@ func GetRedisClusterNodes(ctx context.Context, address string, username string, 
 		nodeIds = append(nodeIds, nodeId)
 	}
 	if slotsCount != 16384 {
-		log.Panicf("invalid cluster nodes slots. slots_count=%v, address=%v", slotsCount, address)
+		return nil, nil, fmt.Errorf("invalid cluster nodes slots. slots_count=%v, address=%v", slotsCount, address)
 	}
 
 	for _, id := range nodeIds {
@@ -114,9 +162,9 @@ func GetRedisClusterNodes(ctx context.Context, address string, username string, 
 		} else if masterAddr, exist := masters[id]; exist {
 			addresses = append(addresses, masterAddr)
 		} else {
-			log.Panicf("unknown id=%s", id)
+			return nil, nil, fmt.Errorf("unknown id=%s", id)
 		}
 	}
 
-	return addresses, slots
+	return addresses, slots, nil
 }

@@ -339,7 +339,9 @@ func (w *redisStandaloneWriter) processReply() {
 		// It's good to skip the nil error since some write commands will return the null reply. For example,
 		// the SET command with NX option will return nil if the key already exists.
 		if err != nil && !errors.Is(err, proto.Nil) {
-			if client.IsReconnectableIOError(err) && w.reconnectIO() {
+			if (client.IsReconnectableIOError(err) || client.IsRetryableRedisStateError(err)) && w.reconnectIO() {
+				log.Warnf("[%s] receive reply failed with retryable target error. cmd=[%s], error=[%v]",
+					w.stat.Name, e.String(), err)
 				w.replayInflight()
 				continue
 			}
