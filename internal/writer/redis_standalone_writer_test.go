@@ -3,6 +3,7 @@ package writer
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"RedisShake/internal/config"
 	"RedisShake/internal/entry"
@@ -58,6 +59,54 @@ func Test_redisStandaloneWriter_reconnectIOContinuesBeyondMaxTimes(t *testing.T)
 
 	require.True(t, w.reconnectIO())
 	require.Equal(t, 4, attempts)
+}
+
+func Test_redisStandaloneWriter_reconnectIOAttemptsImmediatelyBeforeDelay(t *testing.T) {
+	orig := config.Opt.Advanced
+	defer func() {
+		config.Opt.Advanced = orig
+	}()
+
+	config.Opt.Advanced.IOReconnect = true
+	config.Opt.Advanced.IOReconnectMaxTimes = 2
+	config.Opt.Advanced.IOReconnectDelayMs = 10000
+
+	called := make(chan struct{}, 1)
+	w := &redisStandaloneWriter{
+		reconnectFn: func() error {
+			called <- struct{}{}
+			return nil
+		},
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- w.reconnectIO()
+	}()
+
+	select {
+	case <-called:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("reconnectFn was not called immediately")
+	}
+
+	select {
+	case ok := <-done:
+		require.True(t, ok)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("reconnectIO did not return after immediate reconnect")
+	}
+}
+
+func TestResolveWriterShardsForOptionsDisablesShardsForCluster(t *testing.T) {
+	orig := config.Opt.Advanced
+	defer func() {
+		config.Opt.Advanced = orig
+	}()
+
+	config.Opt.Advanced.TargetRedisWriterShards = 4
+	require.Equal(t, 1, resolveWriterShardsForOptions(&RedisWriterOptions{Cluster: true}))
+	require.Equal(t, 4, resolveWriterShardsForOptions(&RedisWriterOptions{Cluster: false}))
 }
 
 func Test_redisStandaloneWriter_resetInflight(t *testing.T) {

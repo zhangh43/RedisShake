@@ -32,6 +32,8 @@ type Redis struct {
 	protoWriter *proto.Writer
 }
 
+const metadataCommandTimeout = 3 * time.Second
+
 type TlsConfig struct {
 	CACertFilePath string `mapstructure:"ca_cert" default:""`
 	CertFilePath   string `mapstructure:"cert" default:""`
@@ -98,9 +100,9 @@ func (r *Redis) connect() error {
 			err   error
 		)
 		if r.username != "" {
-			reply, err = r.DoWithStringReplyWithError("auth", r.username, r.password)
+			reply, err = r.DoWithStringReplyWithTimeout(metadataCommandTimeout, "auth", r.username, r.password)
 		} else {
-			reply, err = r.DoWithStringReplyWithError("auth", r.password)
+			reply, err = r.DoWithStringReplyWithTimeout(metadataCommandTimeout, "auth", r.password)
 		}
 		if err != nil {
 			return err
@@ -111,7 +113,7 @@ func (r *Redis) connect() error {
 	}
 
 	// ping to test connection
-	reply, err := r.DoWithStringReplyWithError("ping")
+	reply, err := r.DoWithStringReplyWithTimeout(metadataCommandTimeout, "ping")
 	if err != nil {
 		return err
 	}
@@ -120,7 +122,7 @@ func (r *Redis) connect() error {
 	}
 	// get best replica
 	if r.replica {
-		reply, err = r.DoWithStringReplyWithError("info", "replication")
+		reply, err = r.DoWithStringReplyWithTimeout(metadataCommandTimeout, "info", "replication")
 		if err != nil {
 			return err
 		}
@@ -248,6 +250,19 @@ func (r *Redis) DoWithStringReplyWithError(args ...interface{}) (string, error) 
 		return "", errors.New("reply is not string")
 	}
 	return reply, nil
+}
+
+func (r *Redis) DoWithStringReplyWithTimeout(timeout time.Duration, args ...interface{}) (string, error) {
+	if timeout <= 0 {
+		return r.DoWithStringReplyWithError(args...)
+	}
+	if err := r.conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = r.conn.SetDeadline(time.Time{})
+	}()
+	return r.DoWithStringReplyWithError(args...)
 }
 
 func (r *Redis) Do(args ...interface{}) interface{} {

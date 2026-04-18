@@ -735,11 +735,11 @@ func (r *scanStandaloneReader) Status() interface{} {
 
 func (r *scanStandaloneReader) StatusString() string {
 	if !r.opts.Scan || r.stat.ScanFinished {
-		return fmt.Sprintf("synced_key_count=[%d], synced_key_ops=[%.2f], need_update_count=[%d]",
-			r.stat.SyncedKeyCount, r.stat.SyncedKeyOps, r.stat.NeedUpdateCount)
+		return fmt.Sprintf("queue_len=[%d], scan_paused=[%t], synced_key_count=[%d], synced_key_ops=[%.2f], need_update_count=[%d]",
+			r.getQueueLen(), r.scanPaused.Load(), r.stat.SyncedKeyCount, r.stat.SyncedKeyOps, r.stat.NeedUpdateCount)
 	}
-	return fmt.Sprintf("scan_dbid=[%d], scan_percent=[%s], synced_key_count=[%d], synced_key_ops=[%.2f], need_update_count=[%d]",
-		r.stat.ScanDbId, r.stat.ScanPercentByDbId, r.stat.SyncedKeyCount, r.stat.SyncedKeyOps, r.stat.NeedUpdateCount)
+	return fmt.Sprintf("scan_dbid=[%d], scan_percent=[%s], queue_len=[%d], scan_paused=[%t], synced_key_count=[%d], synced_key_ops=[%.2f], need_update_count=[%d]",
+		r.stat.ScanDbId, r.stat.ScanPercentByDbId, r.getQueueLen(), r.scanPaused.Load(), r.stat.SyncedKeyCount, r.stat.SyncedKeyOps, r.stat.NeedUpdateCount)
 }
 
 func (r *scanStandaloneReader) StatusConsistent() bool {

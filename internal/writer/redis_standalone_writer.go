@@ -83,9 +83,9 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 			}
 		}
 		roundAttempt := (attempt-1)%maxTimes + 1
-		log.Warnf("[%s] reconnecting target redis. attempt=[%d/%d], delay=[%s]",
-			w.stat.Name, roundAttempt, maxTimes, delay)
-		if delay > 0 {
+		log.Warnf("[%s] reconnecting target redis. address=[%s], attempt=[%d/%d], delay=[%s]",
+			w.stat.Name, w.address, roundAttempt, maxTimes, delay)
+		if attempt > 1 && delay > 0 {
 			if w.ctx != nil {
 				select {
 				case <-w.ctx.Done():
@@ -98,7 +98,10 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 		}
 		reconnectFn := w.reconnectFn
 		if reconnectFn == nil {
+			log.Warnf("[%s] reconnectFn is nil, falling back to direct reconnect. address=[%s]", w.stat.Name, w.address)
 			reconnectFn = w.client.Reconnect
+		} else {
+			log.Warnf("[%s] calling reconnectFn (cluster topology refresh). address=[%s]", w.stat.Name, w.address)
 		}
 		if err := reconnectFn(); err == nil {
 			if w.DbId != 0 {
@@ -107,7 +110,7 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 					continue
 				}
 			}
-			log.Warnf("[%s] reconnected target redis. db=[%d]", w.stat.Name, w.DbId)
+			log.Warnf("[%s] reconnected target redis. address=[%s], db=[%d]", w.stat.Name, w.address, w.DbId)
 			return true
 		}
 		if roundAttempt == maxTimes {
@@ -125,6 +128,7 @@ func (w *redisStandaloneWriter) SetReconnectFn(fn func() error) {
 }
 
 func (w *redisStandaloneWriter) UpdateTarget(ctx context.Context, opts *RedisWriterOptions) error {
+	oldAddress := w.address
 	newClient, err := client.NewRedisClientWithError(ctx, opts.Address, opts.Username, opts.Password, opts.Tls, opts.TlsConfig, false)
 	if err != nil {
 		return err
@@ -146,20 +150,30 @@ func (w *redisStandaloneWriter) UpdateTarget(ctx context.Context, opts *RedisWri
 	oldClient := w.client
 	w.client = newClient
 	w.address = opts.Address
+	w.stat.Name = "writer_" + strings.Replace(opts.Address, ":", "_", -1)
 	if oldClient != nil {
 		oldClient.Close()
 	}
+	log.Warnf("[%s] switched target redis. old_address=[%s], new_address=[%s], db=[%d]", w.stat.Name, oldAddress, w.address, w.DbId)
 	return nil
 }
 
 func NewRedisStandaloneWriter(ctx context.Context, opts *RedisWriterOptions) Writer {
-	shards := resolveStandaloneWriterShards()
+	shards := resolveWriterShardsForOptions(opts)
 	log.Infof("redis_writer effective option: cluster=[%v], address=[%s], target_redis_writer_shards=[%d], resolved_writer_shards=[%d]",
 		opts.Cluster, opts.Address, config.Opt.Advanced.TargetRedisWriterShards, shards)
 	if shards > 1 {
 		return newRedisShardedStandaloneWriter(ctx, opts, shards)
 	}
 	return newRedisStandaloneWriterWithLimits(ctx, opts, config.Opt.Advanced.TargetRedisMaxQPS, config.Opt.Advanced.PipelineCountLimit)
+}
+
+func resolveWriterShardsForOptions(opts *RedisWriterOptions) int {
+	shards := resolveStandaloneWriterShards()
+	if opts != nil && opts.Cluster {
+		return 1
+	}
+	return shards
 }
 
 func newRedisStandaloneWriterWithLimits(ctx context.Context, opts *RedisWriterOptions, maxQPS int, pipeLimit uint64) *redisStandaloneWriter {
@@ -186,6 +200,7 @@ func newRedisStandaloneWriterWithLimits(ctx context.Context, opts *RedisWriterOp
 		rw.chWaitWg.Add(1)
 		go rw.processReply()
 	}
+	log.Infof("[%s] connected target redis. address=[%s], off_reply=[%t]", rw.stat.Name, rw.address, rw.offReply)
 	return rw
 }
 

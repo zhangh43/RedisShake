@@ -81,6 +81,7 @@ func newRedisShardedStandaloneWriter(ctx context.Context, opts *RedisWriterOptio
 	for i := 0; i < shards; i++ {
 		shardWriter := newRedisStandaloneWriterWithLimits(ctx, opts, perQPS, perPipe)
 		shardWriter.stat.Name = fmt.Sprintf("%s_shard_%d", shardWriter.stat.Name, i)
+		log.Infof("[%s] shard writer initialized. target_address=[%s]", shardWriter.stat.Name, shardWriter.address)
 		w.shards = append(w.shards, shardWriter)
 	}
 	log.Infof("redis writer sharding enabled. cluster=[%v], address=[%s], shards=[%d], per_shard_qps=[%d], per_shard_pipeline=[%d]",
@@ -99,6 +100,7 @@ func (w *redisShardedStandaloneWriter) SetReconnectFn(fn func() error) {
 }
 
 func (w *redisShardedStandaloneWriter) UpdateTarget(ctx context.Context, opts *RedisWriterOptions) error {
+	oldAddress := w.address
 	for _, shard := range w.shards {
 		if err := shard.UpdateTarget(ctx, opts); err != nil {
 			return err
@@ -106,6 +108,7 @@ func (w *redisShardedStandaloneWriter) UpdateTarget(ctx context.Context, opts *R
 	}
 	w.address = opts.Address
 	w.stat.Name = "writer_sharded_" + opts.Address
+	log.Warnf("[%s] switched sharded target redis. old_address=[%s], new_address=[%s], shards=[%d]", w.stat.Name, oldAddress, w.address, w.shardCount)
 	return nil
 }
 
