@@ -14,6 +14,7 @@ import (
 
 type redisShardedStandaloneWriter struct {
 	shardCount int
+	address    string
 	shards     []*redisStandaloneWriter
 	ch         chan *entry.Entry
 	wg         sync.WaitGroup
@@ -65,6 +66,7 @@ func newRedisShardedStandaloneWriter(ctx context.Context, opts *RedisWriterOptio
 	}
 	w := &redisShardedStandaloneWriter{
 		shardCount: shards,
+		address:    opts.Address,
 		ch:         make(chan *entry.Entry, int(config.Opt.Advanced.PipelineCountLimit)),
 	}
 	w.stat.Name = "writer_sharded_" + opts.Address
@@ -84,6 +86,27 @@ func newRedisShardedStandaloneWriter(ctx context.Context, opts *RedisWriterOptio
 	log.Infof("redis writer sharding enabled. cluster=[%v], address=[%s], shards=[%d], per_shard_qps=[%d], per_shard_pipeline=[%d]",
 		opts.Cluster, opts.Address, shards, perQPS, perPipe)
 	return w
+}
+
+func (w *redisShardedStandaloneWriter) Address() string {
+	return w.address
+}
+
+func (w *redisShardedStandaloneWriter) SetReconnectFn(fn func() error) {
+	for _, shard := range w.shards {
+		shard.SetReconnectFn(fn)
+	}
+}
+
+func (w *redisShardedStandaloneWriter) UpdateTarget(ctx context.Context, opts *RedisWriterOptions) error {
+	for _, shard := range w.shards {
+		if err := shard.UpdateTarget(ctx, opts); err != nil {
+			return err
+		}
+	}
+	w.address = opts.Address
+	w.stat.Name = "writer_sharded_" + opts.Address
+	return nil
 }
 
 func (w *redisShardedStandaloneWriter) StartWrite(ctx context.Context) chan *entry.Entry {

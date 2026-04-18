@@ -158,11 +158,36 @@ func TestIsRetryableRedisStateError(t *testing.T) {
 		{errors.New("TRYAGAIN Multiple keys request during rehashing of slot"), true},
 		{errors.New("LOADING Redis is loading the dataset in memory"), true},
 		{errors.New("MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'"), true},
+		{errors.New("READONLY You can't write against a read only replica."), true},
+		{errors.New("MOVED 12182 127.0.0.1:7002"), true},
+		{errors.New("ASK 12182 127.0.0.1:7002"), true},
 		{errors.New("ERR unknown command"), false},
 	}
 	for _, tc := range cases {
 		if got := IsRetryableRedisStateError(tc.err); got != tc.want {
 			t.Fatalf("IsRetryableRedisStateError(%v)=%v want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestIsFatalRedisStateError(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{errors.New("ERR unknown command `FOO`"), true},
+		{errors.New("unknown command"), true},
+		{errors.New("ERR wrong number of arguments for 'set' command"), true},
+		{errors.New("ERR syntax error"), true},
+		{errors.New("NOAUTH Authentication required."), true},
+		{errors.New("NOPERM this user has no permissions to run the 'set' command"), true},
+		{errors.New("READONLY You can't write against a read only replica."), false},
+		{errors.New("MOVED 12182 127.0.0.1:7002"), false},
+		{errors.New("ERR something else"), false},
+	}
+	for _, tc := range cases {
+		if got := IsFatalRedisStateError(tc.err); got != tc.want {
+			t.Fatalf("IsFatalRedisStateError(%v)=%v want %v", tc.err, got, tc.want)
 		}
 	}
 }

@@ -36,6 +36,7 @@ type redisStandaloneWriter struct {
 	DbId        int
 	ctx         context.Context
 	reconnectFn func() error
+	reconnectMu sync.Mutex
 
 	chWaitReply chan *replyItem
 	chWaitWg    sync.WaitGroup
@@ -66,6 +67,8 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 	if !config.Opt.Advanced.IOReconnect {
 		return false
 	}
+	w.reconnectMu.Lock()
+	defer w.reconnectMu.Unlock()
 	delay := time.Duration(config.Opt.Advanced.IOReconnectDelayMs) * time.Millisecond
 	maxTimes := config.Opt.Advanced.IOReconnectMaxTimes
 	if maxTimes <= 0 {
@@ -111,6 +114,42 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 			log.Warnf("[%s] target redis reconnect attempts exhausted. continuing to retry until context is canceled", w.stat.Name)
 		}
 	}
+}
+
+func (w *redisStandaloneWriter) Address() string {
+	return w.address
+}
+
+func (w *redisStandaloneWriter) SetReconnectFn(fn func() error) {
+	w.reconnectFn = fn
+}
+
+func (w *redisStandaloneWriter) UpdateTarget(ctx context.Context, opts *RedisWriterOptions) error {
+	newClient, err := client.NewRedisClientWithError(ctx, opts.Address, opts.Username, opts.Password, opts.Tls, opts.TlsConfig, false)
+	if err != nil {
+		return err
+	}
+	if w.DbId != 0 {
+		reply, err := newClient.DoWithStringReplyWithError("select", strconv.Itoa(w.DbId))
+		if err != nil {
+			newClient.Close()
+			return err
+		}
+		if reply != "OK" {
+			newClient.Close()
+			return errors.New("select failed with reply: " + reply)
+		}
+	}
+	if w.offReply {
+		newClient.Send("CLIENT", "REPLY", "OFF")
+	}
+	oldClient := w.client
+	w.client = newClient
+	w.address = opts.Address
+	if oldClient != nil {
+		oldClient.Close()
+	}
+	return nil
 }
 
 func NewRedisStandaloneWriter(ctx context.Context, opts *RedisWriterOptions) Writer {
@@ -339,12 +378,6 @@ func (w *redisStandaloneWriter) processReply() {
 		// It's good to skip the nil error since some write commands will return the null reply. For example,
 		// the SET command with NX option will return nil if the key already exists.
 		if err != nil && !errors.Is(err, proto.Nil) {
-			if (client.IsReconnectableIOError(err) || client.IsRetryableRedisStateError(err)) && w.reconnectIO() {
-				log.Warnf("[%s] receive reply failed with retryable target error. cmd=[%s], error=[%v]",
-					w.stat.Name, e.String(), err)
-				w.replayInflight()
-				continue
-			}
 			if err.Error() == "BUSYKEY Target key name already exists." {
 				if config.Opt.Advanced.RDBRestoreCommandBehavior == "skip" {
 					log.Debugf("[%s] redisStandaloneWriter received BUSYKEY reply. cmd=[%s]", w.stat.Name, e.String())
@@ -370,6 +403,11 @@ func (w *redisStandaloneWriter) processReply() {
 					}
 					w.Write(en)
 				}(e)
+				continue
+			} else if !client.IsFatalRedisStateError(err) && w.reconnectIO() {
+				log.Warnf("[%s] receive reply failed. reconnecting target and replaying inflight. cmd=[%s], error=[%v]",
+					w.stat.Name, e.String(), err)
+				w.replayInflight()
 				continue
 			} else {
 				log.Panicf("[%s] receive reply failed. cmd=[%s], error=[%v]", w.stat.Name, e.String(), err)

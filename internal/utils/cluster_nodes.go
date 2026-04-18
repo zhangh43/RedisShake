@@ -80,7 +80,7 @@ func getRedisClusterNodesOnce(ctx context.Context, address string, username stri
 
 		// address
 		address := strings.Split(words[1], "@")[0]
-		
+
 		// handle ipv6 address
 		tok := strings.Split(address, ":")
 		if len(tok) > 2 {
@@ -90,13 +90,13 @@ func getRedisClusterNodesOnce(ctx context.Context, address string, username stri
 			ipv6Addr := strings.Join(tok[:len(tok)-1], ":")
 			address = fmt.Sprintf("[%s]:%s", ipv6Addr, port)
 		}
-		
+
 		// handle hostname
-		hostname := strings.Split(words[1],",")
+		hostname := strings.Split(words[1], ",")
 		if len(hostname) > 1 {
-                        address = fmt.Sprintf("%s:%s", hostname[1], tok[len(tok)-1])
-                }
-		
+			address = fmt.Sprintf("%s:%s", hostname[1], tok[len(tok)-1])
+		}
+
 		if isMaster && len(words) < 9 {
 			log.Warnf("the current master node does not hold any slots. address=[%v]", address)
 			continue

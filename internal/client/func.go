@@ -89,5 +89,20 @@ func IsRetryableRedisStateError(err error) bool {
 		strings.Contains(msg, "clusterdown") ||
 		strings.Contains(msg, "tryagain") ||
 		strings.Contains(msg, "loading") ||
-		strings.Contains(msg, "masterdown")
+		strings.Contains(msg, "masterdown") ||
+		strings.Contains(msg, "readonly") ||
+		strings.Contains(msg, "moved") ||
+		strings.Contains(msg, "ask")
+}
+
+func IsFatalRedisStateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unknown command") ||
+		strings.Contains(msg, "wrong number of arguments") ||
+		strings.Contains(msg, "syntax error") ||
+		strings.Contains(msg, "noauth") ||
+		strings.Contains(msg, "noperm")
 }

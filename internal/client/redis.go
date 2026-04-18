@@ -64,7 +64,7 @@ func NewRedisClientWithError(ctx context.Context, address string, username strin
 
 func (r *Redis) connect() error {
 	var conn net.Conn
-	var dialer = &net.Dialer{
+	dialer := &net.Dialer{
 		Timeout:   5 * time.Minute,
 		KeepAlive: 5 * time.Minute,
 	}
