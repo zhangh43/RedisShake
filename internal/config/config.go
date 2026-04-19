@@ -1,12 +1,13 @@
 package config
 
 import (
-	"RedisShake/internal/log"
 	"bytes"
 	"fmt"
 	"os"
 	"regexp"
 	"strings"
+
+	"RedisShake/internal/log"
 
 	"github.com/mcuadros/go-defaults"
 	"github.com/rs/zerolog"
@@ -79,7 +80,6 @@ type AdvancedOptions struct {
 	TargetRedisOOMRequeueMaxTimes   int    `mapstructure:"target_redis_oom_requeue_max_times" default:"3"`
 	TargetRedisOOMRequeueDelayMs    int    `mapstructure:"target_redis_oom_requeue_delay_ms" default:"500"`
 	RewriteCollectionBatchSize      int    `mapstructure:"rewrite_collection_batch_size" default:"128"`
-	TargetRedisWriterShards         int    `mapstructure:"target_redis_writer_shards" default:"0"`
 
 	AwsPSync string `mapstructure:"aws_psync" default:""` // 10.0.0.1:6379@nmfu2sl5osync,10.0.0.1:6379@xhma21xfkssync
 

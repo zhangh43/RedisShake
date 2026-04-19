@@ -520,6 +520,195 @@ target_mbbloom_version = 20603
 	runDockerWriterIgnoreErr(shakeName)
 }
 
+// TestClusterWriterTwoNodeFailoverWithDocker tests the 2-node cluster scenario
+// that exposed the topology candidate bug in production:
+//
+//   - Cluster has exactly 1 master (A) + 1 slave (B)
+//   - RedisShake is configured with A's address
+//   - A is killed hard (process killed, no TCP)
+//   - B is elected master
+//   - RedisShake must switch to B and continue syncing
+//
+// Previously, after A was killed and B's write connection had a brief error
+// during the leadership transition, `topologyCandidatesLocked` excluded B
+// (the failedWriter) from topology candidates. With only A remaining and A
+// being dead, all topology queries failed → panic after timeout.
+func TestClusterWriterTwoNodeFailoverWithDocker(t *testing.T) {
+	if os.Getenv("RUN_DOCKER_TESTS") != "1" {
+		t.Skip("set RUN_DOCKER_TESTS=1 to run Docker integration tests")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker is not installed")
+	}
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		t.Skip("docker daemon is not available")
+	}
+
+	repoRoot := writerRepoRootFromPackageDir(t)
+	imageName := writerDockerName(t.Name(), "img")
+	buildImageWriter(t, imageName, repoRoot)
+
+	network := writerDockerName(t.Name(), "net")
+	// 2-node cluster: one master, one slave
+	nodeA := writerDockerName(t.Name(), "node-a") // initial master
+	nodeB := writerDockerName(t.Name(), "node-b") // initial slave → new master after kill
+	srcName := writerDockerName(t.Name(), "src")
+	shakeName := writerDockerName(t.Name(), "shake")
+
+	runDockerWriterIgnoreErr(srcName, shakeName, nodeA, nodeB)
+	_ = exec.Command("docker", "network", "rm", network).Run()
+
+	runDockerWriter(t, "network", "create", network)
+	t.Cleanup(func() {
+		runDockerWriterIgnoreErr(srcName, shakeName, nodeA, nodeB)
+		_ = exec.Command("docker", "network", "rm", network).Run()
+		_ = exec.Command("docker", "rmi", "-f", imageName).Run()
+	})
+
+	for _, node := range []string{nodeA, nodeB} {
+		runDockerWriter(t, "run", "-d", "--name", node, "--network", network,
+			"redis:7.2-alpine", "redis-server",
+			"--port", "6379",
+			"--cluster-enabled", "yes",
+			"--cluster-config-file", "nodes.conf",
+			"--cluster-node-timeout", "3000",
+			"--appendonly", "no",
+			"--protected-mode", "no",
+			"--bind", "0.0.0.0")
+	}
+	waitRedisReadyWriter(t, nodeA)
+	waitRedisReadyWriter(t, nodeB)
+
+	// Create a 2-node cluster: 1 master + 1 replica
+	runDockerWriter(t, "exec", nodeA, "redis-cli", "--cluster", "create",
+		nodeA+":6379", nodeB+":6379",
+		"--cluster-replicas", "0", "--cluster-yes")
+	waitClusterReadyWriter(t, nodeA)
+
+	// Add nodeB as replica of nodeA
+	nodeAID := clusterMyIDWriter(t, nodeA)
+	runDockerWriter(t, "exec", nodeB, "redis-cli", "cluster", "replicate", nodeAID)
+
+	// Wait for nodeB to become a replica
+	waitForClusterRoleWriter(t, nodeB, "slave", 15*time.Second)
+
+	// Source redis (standalone) with KSN for live sync
+	runDockerWriter(t, "run", "-d", "--name", srcName, "--network", network,
+		"redis:7.2-alpine", "redis-server",
+		"--appendonly", "no", "--protected-mode", "no", "--bind", "0.0.0.0",
+		"--notify-keyspace-events", "AKE")
+	waitRedisReadyWriter(t, srcName)
+
+	writeKeysViaPipeWriter(t, srcName, "pre", 500)
+
+	cfgPath := writerWriteTwoNodeConfig(t, srcName, nodeA)
+
+	runDockerWriter(t, "run", "-d", "--name", shakeName, "--network", network,
+		"-v", cfgPath+":/work/shake.toml:ro",
+		"--entrypoint", "/app/redis-shake",
+		imageName, "/work/shake.toml")
+
+	waitForLogInContainerWriter(t, shakeName, "start syncing...", 20*time.Second)
+	waitForClusterKeyExistsWriter(t, nodeA, "pre:0", 20*time.Second, shakeName)
+
+	// Find a key that lands in nodeA's slot range so we can write it after failover
+	slotStart, slotEnd := clusterMyselfMasterSlotRangeWriter(t, nodeA)
+	failoverKey := findKeyForSlotRangeWriter(t, nodeA, "post-failover", slotStart, slotEnd)
+
+	// Kill nodeA hard — no graceful shutdown, no TCP
+	runDockerWriterIgnoreErr(nodeA)
+
+	// Wait for nodeB to become master
+	waitForClusterRoleWriter(t, nodeB, "master", 20*time.Second)
+
+	// Write a new key to the source; RedisShake must sync it through nodeB
+	runDockerWriter(t, "exec", srcName, "redis-cli", "SET", failoverKey, "after-kill")
+
+	// RedisShake must detect the topology change and reconnect to nodeB
+	waitForLogInContainerWriter(t, shakeName, "redis cluster topology refreshed.", 60*time.Second)
+
+	// Verify the post-failover key was synced to nodeB
+	waitForClusterKeyExistsWriter(t, nodeB, failoverKey, 30*time.Second, shakeName)
+
+	logs := dockerLogsWriter(t, shakeName)
+	require.NotContains(t, logs, "panic:")
+}
+
+func writerWriteTwoNodeConfig(t *testing.T, srcName, masterNode string) string {
+	t.Helper()
+	cfgPath := filepath.Join(t.TempDir(), "shake.toml")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(fmt.Sprintf(`
+[scan_reader]
+cluster = false
+address = "%s:6379"
+username = ""
+password = ""
+tls = false
+dbs = [0]
+scan = true
+ksn = true
+count = 64
+prefer_replica = false
+
+[redis_writer]
+cluster = true
+address = "%s:6379"
+username = ""
+password = ""
+tls = false
+off_reply = false
+
+[filter]
+allow_keys = []
+allow_key_prefix = []
+allow_key_suffix = []
+allow_key_regex = []
+block_keys = []
+block_key_prefix = []
+block_key_suffix = []
+block_key_regex = []
+allow_db = []
+block_db = []
+allow_command = []
+block_command = []
+allow_command_group = []
+block_command_group = []
+function = ""
+
+[advanced]
+dir = "%s"
+ncpu = 2
+pprof_port = 0
+status_port = 0
+log_file = "shake.log"
+log_level = "info"
+log_interval = 2
+log_rotation = false
+log_max_size = 8
+log_max_age = 1
+log_max_backups = 1
+log_compress = false
+io_reconnect = true
+io_reconnect_max_times = 20
+io_reconnect_delay_ms = 500
+rdb_restore_command_behavior = "rewrite"
+pipeline_count_limit = 64
+target_redis_max_qps = 50000
+target_redis_oom_requeue = false
+target_redis_oom_requeue_max_times = 3
+target_redis_oom_requeue_delay_ms = 500
+rewrite_collection_batch_size = 128
+target_redis_client_max_querybuf_len = 67108864
+target_redis_proto_max_bulk_len = 512000000
+aws_psync = ""
+empty_db_before_sync = true
+
+[module]
+target_mbbloom_version = 20603
+`, srcName, masterNode, t.TempDir())), 0o644))
+	return cfgPath
+}
+
 func writerRepoRootFromPackageDir(t *testing.T) string {
 	t.Helper()
 	wd, err := os.Getwd()

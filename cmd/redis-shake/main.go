@@ -1,15 +1,18 @@
 package main
 
 import (
-	"RedisShake/internal/client"
 	"context"
+	"fmt"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"RedisShake/internal/client"
 
 	"RedisShake/internal/config"
 	"RedisShake/internal/entry"
@@ -19,9 +22,6 @@ import (
 	"RedisShake/internal/status"
 	"RedisShake/internal/utils"
 	"RedisShake/internal/writer"
-
-	"fmt"
-	"runtime"
 
 	"github.com/mcuadros/go-defaults"
 )
@@ -303,8 +303,6 @@ func logAdvancedFeatureConfig() {
 		config.Opt.Advanced.TargetRedisOOMRequeue, config.Opt.Advanced.TargetRedisOOMRequeueMaxTimes, config.Opt.Advanced.TargetRedisOOMRequeueDelayMs)
 	log.Infof("advanced option: rewrite_collection_batch_size=[%d]",
 		config.Opt.Advanced.RewriteCollectionBatchSize)
-	log.Infof("advanced option: target_redis_writer_shards=[%d] (0 means auto)",
-		config.Opt.Advanced.TargetRedisWriterShards)
 	log.Infof("advanced option: target_redis_proto_max_bulk_len=[%d]",
 		config.Opt.Advanced.TargetRedisProtoMaxBulkLen)
 }

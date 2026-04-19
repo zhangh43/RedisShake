@@ -2,6 +2,7 @@ package writer
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -44,6 +45,18 @@ func (w *fakeClusterManagedWriter) UpdateTarget(_ context.Context, opts *RedisWr
 	return nil
 }
 
+// blockingFakeWriter is a fakeClusterManagedWriter whose Write sends to a real
+// buffered channel. This allows tests to exercise the case where Write() blocks
+// on a full channel, which is required to reproduce the deadlock between
+// ClusterWriter.Write (holding r.mu.RLock) and refreshTopologyAndReconnect
+// (waiting for r.mu.Lock).
+type blockingFakeWriter struct {
+	fakeClusterManagedWriter
+	ch chan *entry.Entry
+}
+
+func (w *blockingFakeWriter) Write(e *entry.Entry) { w.ch <- e }
+
 func TestRedisClusterWriterRefreshTopologyAndReconnect(t *testing.T) {
 	ctx := context.Background()
 	writerA := &fakeClusterManagedWriter{address: "10.0.0.1:6379", statusConsistent: true}
@@ -53,7 +66,9 @@ func TestRedisClusterWriterRefreshTopologyAndReconnect(t *testing.T) {
 		opts: RedisWriterOptions{
 			Address: "10.0.0.1:6379",
 		},
-		writers: []clusterManagedWriter{writerA, writerB},
+		addresses:  []string{"10.0.0.1:6379", "10.0.0.2:6379"},
+		knownNodes: []string{"10.0.0.1:6379", "10.0.0.10:6379", "10.0.0.2:6379", "10.0.0.20:6379"},
+		writers:    []clusterManagedWriter{writerA, writerB},
 		getClusterNodes: func(context.Context, string, string, string, bool, client.TlsConfig, bool) ([]string, [][]int) {
 			return []string{"10.0.0.3:6379", "10.0.0.2:6379"}, [][]int{
 				buildSlotRange(0, 8191),
@@ -109,10 +124,12 @@ func TestRedisClusterWriterRefreshTopologyRejectsSlotMigration(t *testing.T) {
 		opts: RedisWriterOptions{
 			Address: "10.0.0.1:6379",
 		},
-		writers: []clusterManagedWriter{writerA, writerB},
+		addresses:  []string{"10.0.0.1:6379", "10.0.0.2:6379"},
+		knownNodes: []string{"10.0.0.1:6379", "10.0.0.10:6379", "10.0.0.2:6379"},
+		writers:    []clusterManagedWriter{writerA, writerB},
 		getClusterNodes: func(context.Context, string, string, string, bool, client.TlsConfig, bool) ([]string, [][]int) {
 			return []string{"10.0.0.3:6379"}, [][]int{
-				[]int{8191, 8192},
+				{8191, 8192},
 			}
 		},
 		getClusterSnapshotFromAny: func(context.Context, []string, string, string, bool, client.TlsConfig, bool) utils.ClusterNodesSnapshot {
@@ -151,7 +168,9 @@ func TestRedisClusterWriterBindReconnectUsesRefresh(t *testing.T) {
 		opts: RedisWriterOptions{
 			Address: "10.0.0.1:6379",
 		},
-		writers: []clusterManagedWriter{writerA},
+		addresses:  []string{"10.0.0.1:6379"},
+		knownNodes: []string{"10.0.0.1:6379", "10.0.0.10:6379"},
+		writers:    []clusterManagedWriter{writerA},
 		getClusterNodes: func(context.Context, string, string, string, bool, client.TlsConfig, bool) ([]string, [][]int) {
 			return []string{"10.0.0.4:6379"}, [][]int{buildSlotRange(0, 16383)}
 		},
@@ -224,11 +243,16 @@ func TestRedisClusterWriterFetchLatestTopologyReturnsFirstSuccessfulResult(t *te
 	}
 }
 
-func TestRedisClusterWriterRefreshTopologyUsesFallbackCandidate(t *testing.T) {
+// TestRedisClusterWriterRefreshTopologyQueriesAllCandidates verifies that the
+// topology refresh queries ALL known nodes in parallel — including the failedWriter
+// itself. Previously the failedWriter was excluded, which broke 2-node clusters
+// where the failedWriter becomes the new master after the old master dies.
+func TestRedisClusterWriterRefreshTopologyQueriesAllCandidates(t *testing.T) {
 	ctx := context.Background()
 	writerA := &fakeClusterManagedWriter{address: "10.0.0.1:6379", statusConsistent: true}
 	writerB := &fakeClusterManagedWriter{address: "10.0.0.2:6379", statusConsistent: true}
-	called := make(chan string, 5)
+	// 5 unique candidates after dedup: knownNodes(4) + opts.Address(1 new)
+	calledCh := make(chan string, 5)
 	r := &RedisClusterWriter{
 		ctx: ctx,
 		opts: RedisWriterOptions{
@@ -248,8 +272,9 @@ func TestRedisClusterWriterRefreshTopologyUsesFallbackCandidate(t *testing.T) {
 			}
 		},
 		getClusterSnapshot: func(_ context.Context, address string, _ string, _ string, _ bool, _ client.TlsConfig, _ bool) (utils.ClusterNodesSnapshot, error) {
-			called <- address
+			calledCh <- address
 			if address == "10.0.0.1:6379" {
+				// failedWriter is slow — another candidate should win the race
 				time.Sleep(50 * time.Millisecond)
 				return utils.ClusterNodesSnapshot{}, context.DeadlineExceeded
 			}
@@ -273,10 +298,55 @@ func TestRedisClusterWriterRefreshTopologyUsesFallbackCandidate(t *testing.T) {
 	err := r.refreshTopologyAndReconnect(writerA)
 
 	require.NoError(t, err)
-	got := []string{<-called, <-called}
-	require.True(t, containsString(got, "10.0.0.11:6379") || containsString(got, "10.0.0.2:6379") || containsString(got, "10.0.0.22:6379"))
+	// Collect all 5 queried addresses (one per candidate, sent before any blocking)
+	queried := make([]string, 5)
+	for i := range queried {
+		queried[i] = <-calledCh
+	}
+	// failedWriter IS now included as a candidate (unlike the old behavior)
+	require.True(t, containsString(queried, "10.0.0.1:6379"), "failedWriter must be queried")
+	// at least one other candidate was also queried
+	require.True(t, containsString(queried, "10.0.0.11:6379") || containsString(queried, "10.0.0.2:6379") || containsString(queried, "10.0.0.22:6379"))
 	require.Equal(t, []string{"10.0.0.3:6379"}, writerA.updateCalls)
 	require.Equal(t, []string{"10.0.0.3:6379", "10.0.0.33:6379", "10.0.0.2:6379", "10.0.0.22:6379"}, r.knownNodes)
+}
+
+// TestRedisClusterWriterRefreshTopologyWorksWhenOnlyFailedWriterIsAvailable covers
+// the 2-node cluster production scenario: old master dies, failedWriter becomes the
+// new master, but all OTHER topology candidates are also unreachable. The refresh
+// must query the failedWriter itself to discover the new topology.
+func TestRedisClusterWriterRefreshTopologyWorksWhenOnlyFailedWriterIsAvailable(t *testing.T) {
+	ctx := context.Background()
+	writerA := &fakeClusterManagedWriter{address: "10.0.0.1:6379", statusConsistent: true}
+	r := &RedisClusterWriter{
+		ctx: ctx,
+		opts: RedisWriterOptions{
+			Address: "10.0.0.1:6379", // seed = failedWriter (2-node cluster, only node left)
+		},
+		addresses:  []string{"10.0.0.1:6379"},
+		knownNodes: []string{"10.0.0.1:6379", "10.0.0.2:6379"}, // 10.0.0.2 was old master, now dead
+		writers:    []clusterManagedWriter{writerA},
+		getClusterSnapshot: func(_ context.Context, address string, _ string, _ string, _ bool, _ client.TlsConfig, _ bool) (utils.ClusterNodesSnapshot, error) {
+			if address == "10.0.0.2:6379" {
+				return utils.ClusterNodesSnapshot{}, fmt.Errorf("connection refused")
+			}
+			// 10.0.0.1 is the new master — returns correct topology
+			return utils.ClusterNodesSnapshot{
+				Addresses: []string{"10.0.0.1:6379"},
+				Slots:     [][]int{buildSlotRange(0, 16383)},
+				AllNodes:  []string{"10.0.0.1:6379", "10.0.0.2:6379"},
+			}, nil
+		},
+	}
+	for slot := 0; slot < KeySlots; slot++ {
+		r.router[slot] = writerA
+	}
+
+	err := r.refreshTopologyAndReconnect(writerA)
+
+	require.NoError(t, err)
+	// writerA reconnected to itself (it's now the master)
+	require.Equal(t, []string{"10.0.0.1:6379"}, writerA.updateCalls)
 }
 
 func TestRedisClusterWriterRefreshTopologyCarriesAllKnownNodesAcrossRefreshes(t *testing.T) {
@@ -350,8 +420,13 @@ func TestRedisClusterWriterRefreshTopologyCarriesAllKnownNodesAcrossRefreshes(t 
 	err = r.refreshTopologyAndReconnect(writerA)
 	require.NoError(t, err)
 	require.Equal(t, "10.0.0.33:6379", writerA.Address())
-	require.Contains(t, called, "10.0.0.11:6379")
-	require.Contains(t, called, "10.0.0.3:6379")
+	// Snapshot called under mu to avoid a data race with goroutines from
+	// fetchLatestTopologyLocked that may still be writing after cancel().
+	mu.Lock()
+	calledSnapshot := append([]string(nil), called...)
+	mu.Unlock()
+	require.Contains(t, calledSnapshot, "10.0.0.11:6379")
+	require.Contains(t, calledSnapshot, "10.0.0.3:6379")
 }
 
 func buildSlotRange(start, end int) []int {
@@ -369,4 +444,87 @@ func containsString(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+// TestClusterWriterWriteDoesNotDeadlockDuringReconnect verifies that
+// ClusterWriter.Write() releases r.mu.RLock before blocking on the downstream
+// channel send. Without the fix, Write() would block on a full channel while
+// still holding r.mu.RLock, which prevents refreshTopologyAndReconnect from
+// acquiring r.mu.Lock — a deadlock.
+//
+// The test uses -timeout (via `go test -timeout 30s`) as the deadlock detector:
+// if the test hangs, go test will kill it and print all goroutine stacks.
+func TestClusterWriterWriteDoesNotDeadlockDuringReconnect(t *testing.T) {
+	const chanSize = 1
+	ctx := context.Background()
+
+	ch := make(chan *entry.Entry, chanSize)
+	writer := &blockingFakeWriter{
+		fakeClusterManagedWriter: fakeClusterManagedWriter{
+			address:          "10.0.0.1:6379",
+			statusConsistent: true,
+		},
+		ch: ch,
+	}
+
+	r := &RedisClusterWriter{
+		ctx:  ctx,
+		opts: RedisWriterOptions{Address: "10.0.0.2:6379"},
+		getClusterSnapshot: func(_ context.Context, _ string, _ string, _ string, _ bool, _ client.TlsConfig, _ bool) (utils.ClusterNodesSnapshot, error) {
+			return utils.ClusterNodesSnapshot{
+				Addresses: []string{"10.0.0.2:6379"},
+				Slots:     [][]int{buildSlotRange(0, 16383)},
+				AllNodes:  []string{"10.0.0.2:6379"},
+			}, nil
+		},
+		addresses:  []string{"10.0.0.1:6379"},
+		knownNodes: []string{"10.0.0.1:6379"},
+		writers:    []clusterManagedWriter{writer},
+	}
+	for slot := 0; slot < KeySlots; slot++ {
+		r.router[slot] = writer
+	}
+
+	e := &entry.Entry{Slots: []int{0}}
+
+	// Fill the channel to capacity so the next Write will block.
+	ch <- e
+
+	// Start a Write that will block on the full channel.
+	writeBlocking := make(chan struct{})
+	writeDone := make(chan struct{})
+	go func() {
+		close(writeBlocking)
+		r.Write(e)
+		close(writeDone)
+	}()
+	<-writeBlocking
+	// Give Write() a moment to reach the channel send and block there.
+	time.Sleep(20 * time.Millisecond)
+
+	// refreshTopologyAndReconnect must complete within the timeout.
+	// With the old code (defer RUnlock inside Write), it would deadlock because
+	// Write holds r.mu.RLock while blocked on the channel, preventing Lock.
+	reconnectDone := make(chan struct{})
+	go func() {
+		_ = r.refreshTopologyAndReconnect(writer)
+		close(reconnectDone)
+	}()
+
+	const deadline = 2 * time.Second
+	select {
+	case <-reconnectDone:
+		// success
+	case <-time.After(deadline):
+		t.Fatalf("deadlock: refreshTopologyAndReconnect did not complete within %s — "+
+			"Write() is likely holding r.mu.RLock while blocked on the channel send", deadline)
+	}
+
+	// Drain the channel so the blocked Write() goroutine can finish.
+	<-ch
+	select {
+	case <-writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Write() did not complete after channel was drained")
+	}
 }

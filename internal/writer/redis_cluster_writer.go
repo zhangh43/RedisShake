@@ -114,11 +114,17 @@ func (r *RedisClusterWriter) refreshTopologyAndReconnect(failedWriter clusterMan
 	if delay <= 0 {
 		delay = 100 * time.Millisecond
 	}
+	maxTimes := config.Opt.Advanced.IOReconnectMaxTimes
+	if maxTimes <= 0 {
+		maxTimes = 1
+	}
 
-	for {
+	var lastErr error
+	for attempt := 1; attempt <= maxTimes; attempt++ {
 		candidates := r.topologyCandidatesLocked(failedWriter)
 		snapshot, snapshotErr := r.fetchLatestTopologyLocked(candidates)
 		if snapshotErr != nil {
+			lastErr = snapshotErr
 			select {
 			case <-r.ctx.Done():
 				return fmt.Errorf("cluster topology refresh canceled while waiting for metadata recovery: %w", snapshotErr)
@@ -130,6 +136,7 @@ func (r *RedisClusterWriter) refreshTopologyAndReconnect(failedWriter clusterMan
 		if applyErr == nil {
 			return nil
 		}
+		lastErr = applyErr
 		if !retryRefresh {
 			return applyErr
 		}
@@ -139,6 +146,7 @@ func (r *RedisClusterWriter) refreshTopologyAndReconnect(failedWriter clusterMan
 		case <-time.After(delay):
 		}
 	}
+	return fmt.Errorf("cluster topology refresh failed after %d attempts: %w", maxTimes, lastErr)
 }
 
 func (r *RedisClusterWriter) fetchLatestTopologyLocked(candidates []string) (utils.ClusterNodesSnapshot, error) {
@@ -249,11 +257,8 @@ func (r *RedisClusterWriter) applyRefreshedTopologyLocked(snapshot utils.Cluster
 	return false, nil
 }
 
-func (r *RedisClusterWriter) topologyCandidatesLocked(failedWriter clusterManagedWriter) []string {
-	candidates := make([]string, 0, len(r.knownNodes)+len(r.addresses)+2)
-	if failedWriter != nil {
-		candidates = append(candidates, failedWriter.Address())
-	}
+func (r *RedisClusterWriter) topologyCandidatesLocked(_ clusterManagedWriter) []string {
+	candidates := make([]string, 0, len(r.knownNodes)+len(r.addresses)+1)
 	candidates = append(candidates, r.knownNodes...)
 	candidates = append(candidates, r.addresses...)
 	candidates = append(candidates, r.opts.Address)
@@ -286,10 +291,17 @@ func (r *RedisClusterWriter) StartWrite(ctx context.Context) chan *entry.Entry {
 }
 
 func (r *RedisClusterWriter) Write(entry *entry.Entry) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	// Look up the target writer(s) under the read lock, then release the lock
+	// before the channel send. This avoids a deadlock where Write() blocks on
+	// a full channel while holding r.mu.RLock(), which prevents
+	// refreshTopologyAndReconnect from acquiring r.mu.Lock() to do reconnect,
+	// which in turn prevents processWrite() from draining the channel.
 	if len(entry.Slots) == 0 {
-		for _, writer := range r.writers {
+		r.mu.RLock()
+		writers := make([]clusterManagedWriter, len(r.writers))
+		copy(writers, r.writers)
+		r.mu.RUnlock()
+		for _, writer := range writers {
 			writer.Write(entry)
 		}
 		return
@@ -303,7 +315,10 @@ func (r *RedisClusterWriter) Write(entry *entry.Entry) {
 			log.Panicf("CROSSSLOT Keys in request don't hash to the same slot. argv=%v", entry.Argv)
 		}
 	}
-	r.router[lastSlot].Write(entry)
+	r.mu.RLock()
+	writer := r.router[lastSlot]
+	r.mu.RUnlock()
+	writer.Write(entry)
 }
 
 func (r *RedisClusterWriter) Consistent() bool {

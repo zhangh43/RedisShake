@@ -74,7 +74,7 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 	if maxTimes <= 0 {
 		maxTimes = 1
 	}
-	for attempt := 1; ; attempt++ {
+	for attempt := 1; attempt <= maxTimes; attempt++ {
 		if w.ctx != nil {
 			select {
 			case <-w.ctx.Done():
@@ -82,9 +82,8 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 			default:
 			}
 		}
-		roundAttempt := (attempt-1)%maxTimes + 1
 		log.Warnf("[%s] reconnecting target redis. address=[%s], attempt=[%d/%d], delay=[%s]",
-			w.stat.Name, w.address, roundAttempt, maxTimes, delay)
+			w.stat.Name, w.address, attempt, maxTimes, delay)
 		if attempt > 1 && delay > 0 {
 			if w.ctx != nil {
 				select {
@@ -113,10 +112,9 @@ func (w *redisStandaloneWriter) reconnectIO() bool {
 			log.Warnf("[%s] reconnected target redis. address=[%s], db=[%d]", w.stat.Name, w.address, w.DbId)
 			return true
 		}
-		if roundAttempt == maxTimes {
-			log.Warnf("[%s] target redis reconnect attempts exhausted. continuing to retry until context is canceled", w.stat.Name)
-		}
 	}
+	log.Panicf("[%s] reconnect failed after %d attempts. address=[%s]", w.stat.Name, maxTimes, w.address)
+	return false
 }
 
 func (w *redisStandaloneWriter) Address() string {
@@ -159,21 +157,7 @@ func (w *redisStandaloneWriter) UpdateTarget(ctx context.Context, opts *RedisWri
 }
 
 func NewRedisStandaloneWriter(ctx context.Context, opts *RedisWriterOptions) Writer {
-	shards := resolveWriterShardsForOptions(opts)
-	log.Infof("redis_writer effective option: cluster=[%v], address=[%s], target_redis_writer_shards=[%d], resolved_writer_shards=[%d]",
-		opts.Cluster, opts.Address, config.Opt.Advanced.TargetRedisWriterShards, shards)
-	if shards > 1 {
-		return newRedisShardedStandaloneWriter(ctx, opts, shards)
-	}
 	return newRedisStandaloneWriterWithLimits(ctx, opts, config.Opt.Advanced.TargetRedisMaxQPS, config.Opt.Advanced.PipelineCountLimit)
-}
-
-func resolveWriterShardsForOptions(opts *RedisWriterOptions) int {
-	shards := resolveStandaloneWriterShards()
-	if opts != nil && opts.Cluster {
-		return 1
-	}
-	return shards
 }
 
 func newRedisStandaloneWriterWithLimits(ctx context.Context, opts *RedisWriterOptions, maxQPS int, pipeLimit uint64) *redisStandaloneWriter {

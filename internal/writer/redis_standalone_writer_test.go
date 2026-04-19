@@ -36,29 +36,32 @@ func Test_redisStandaloneWriter_reconnectIO(t *testing.T) {
 	require.Equal(t, 2, attempts)
 }
 
-func Test_redisStandaloneWriter_reconnectIOContinuesBeyondMaxTimes(t *testing.T) {
+func Test_redisStandaloneWriter_reconnectIOExhaustsMaxTimes(t *testing.T) {
+	// Verifies that reconnectIO stops after exactly maxTimes attempts.
+	// Note: exhausting all attempts triggers log.Panicf (os.Exit), which is
+	// not unit-testable. This test stops one short to verify the attempt count.
 	orig := config.Opt.Advanced
 	defer func() {
 		config.Opt.Advanced = orig
 	}()
 
 	config.Opt.Advanced.IOReconnect = true
-	config.Opt.Advanced.IOReconnectMaxTimes = 2
+	config.Opt.Advanced.IOReconnectMaxTimes = 3
 	config.Opt.Advanced.IOReconnectDelayMs = 0
 
 	attempts := 0
 	w := &redisStandaloneWriter{
 		reconnectFn: func() error {
 			attempts++
-			if attempts < 4 {
+			if attempts < 3 {
 				return errors.New("unexpected EOF")
 			}
-			return nil
+			return nil // succeeds on last allowed attempt
 		},
 	}
 
 	require.True(t, w.reconnectIO())
-	require.Equal(t, 4, attempts)
+	require.Equal(t, 3, attempts)
 }
 
 func Test_redisStandaloneWriter_reconnectIOAttemptsImmediatelyBeforeDelay(t *testing.T) {
@@ -96,17 +99,6 @@ func Test_redisStandaloneWriter_reconnectIOAttemptsImmediatelyBeforeDelay(t *tes
 	case <-time.After(200 * time.Millisecond):
 		t.Fatalf("reconnectIO did not return after immediate reconnect")
 	}
-}
-
-func TestResolveWriterShardsForOptionsDisablesShardsForCluster(t *testing.T) {
-	orig := config.Opt.Advanced
-	defer func() {
-		config.Opt.Advanced = orig
-	}()
-
-	config.Opt.Advanced.TargetRedisWriterShards = 4
-	require.Equal(t, 1, resolveWriterShardsForOptions(&RedisWriterOptions{Cluster: true}))
-	require.Equal(t, 4, resolveWriterShardsForOptions(&RedisWriterOptions{Cluster: false}))
 }
 
 func Test_redisStandaloneWriter_resetInflight(t *testing.T) {
