@@ -59,6 +59,7 @@ type Loader struct {
 	name       string
 	updateFunc func(int64)
 	isValkey   bool // true if reading a Valkey RDB (VALKEY magic string)
+	rdbVersion uint16
 }
 
 func NewLoader(name string, updateFunc func(int64), filPath string, ch chan *entry.Entry) *Loader {
@@ -107,6 +108,7 @@ func (ld *Loader) ParseRDB(ctx context.Context) int {
 		log.Panicf(err.Error())
 	}
 	log.Debugf("[%s] RDB version: %d", ld.name, version)
+	ld.rdbVersion = uint16(version)
 
 	// read entries
 	ld.parseRDBEntry(ctx, rd)
@@ -275,7 +277,13 @@ func (ld *Loader) createValueDump(typeByte byte, val []byte) string {
 	ld.dumpBuffer.Reset()
 	_, _ = ld.dumpBuffer.Write([]byte{typeByte})
 	_, _ = ld.dumpBuffer.Write(val)
-	_ = binary.Write(&ld.dumpBuffer, binary.LittleEndian, uint16(6))
+	// Keep dump version aligned with source RDB version to maximize RESTORE compatibility.
+	version := ld.rdbVersion
+	if version == 0 {
+		// Fallback for safety if ParseRDB wasn't called before createValueDump.
+		version = 6
+	}
+	_ = binary.Write(&ld.dumpBuffer, binary.LittleEndian, version)
 	// calc crc
 	sum64 := utils.CalcCRC64(ld.dumpBuffer.Bytes())
 	_ = binary.Write(&ld.dumpBuffer, binary.LittleEndian, sum64)
