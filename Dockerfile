@@ -1,9 +1,11 @@
 FROM golang:1.21-alpine AS builder
 WORKDIR /app
+ARG VERSION=unknown
+ARG COMMIT=unknown
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -o redis-shake ./cmd/redis-shake
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.Version=${VERSION} -X main.GitCommit=${COMMIT}" -o redis-shake ./cmd/redis-shake
 
 FROM alpine:latest
 WORKDIR /app

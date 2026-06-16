@@ -238,11 +238,39 @@ func Test_scanStandaloneReader_shouldNotDropKSNWithoutBackpressure(t *testing.T)
 	}
 }
 
+func Test_scanStandaloneReader_useCommandReadMode(t *testing.T) {
+	r := &scanStandaloneReader{opts: &ScanReaderOptions{ReadMode: "command"}}
+	require.True(t, r.useCommandReadMode())
+
+	r = &scanStandaloneReader{opts: &ScanReaderOptions{ReadMode: " dump "}}
+	require.False(t, r.useCommandReadMode())
+}
+
+func Test_scanReplyToCursorAndItems(t *testing.T) {
+	cursor, items, err := scanReplyToCursorAndItems([]interface{}{
+		"7",
+		[]interface{}{"field1", "value1", "field2", "value2"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), cursor)
+	require.Equal(t, []string{"field1", "value1", "field2", "value2"}, items)
+}
+
+func Test_scanStandaloneReader_shouldSkipSourceType(t *testing.T) {
+	r := &scanStandaloneReader{
+		opts: &ScanReaderOptions{
+			SkipUnknownType: []string{"stream", "module"},
+		},
+	}
+	require.True(t, r.shouldSkipSourceType("STREAM"))
+	require.False(t, r.shouldSkipSourceType("zset"))
+}
+
 func Test_scanStandaloneReader_StatusIncludesSyncedKeyCount(t *testing.T) {
 	r := &scanStandaloneReader{opts: &ScanReaderOptions{Scan: true}}
 	r.stat.Name = "reader_test"
 	r.stat.ScanDbId = 10
-	r.stat.ScanPercentByDbId = "12.34%"
+	r.stat.SyncPercent = "12.34%"
 	r.stat.SyncedKeyCount = 123
 	r.stat.NeedUpdateCount = 45
 	r.stat.lastSyncedKeyCount = 100
@@ -260,7 +288,7 @@ func Test_scanStandaloneReader_StatusIncludesSyncedKeyCount(t *testing.T) {
 func Test_scanStandaloneReader_StatusString_KSNOnlyHidesScanFields(t *testing.T) {
 	r := &scanStandaloneReader{opts: &ScanReaderOptions{Scan: false}}
 	r.stat.ScanDbId = 10
-	r.stat.ScanPercentByDbId = "12.34%"
+	r.stat.SyncPercent = "12.34%"
 	r.stat.SyncedKeyCount = 123
 	r.stat.NeedUpdateCount = 45
 	r.stat.lastSyncedKeyCount = 100
@@ -269,9 +297,17 @@ func Test_scanStandaloneReader_StatusString_KSNOnlyHidesScanFields(t *testing.T)
 
 	status := r.StatusString()
 	require.NotContains(t, status, "scan_dbid=")
-	require.NotContains(t, status, "scan_percent=")
+	require.NotContains(t, status, "sync_percent=")
 	require.Contains(t, status, "synced_key_count=[123]")
 	require.Contains(t, status, "synced_key_ops=[")
+}
+
+func Test_scanStandaloneReader_updateSyncPercent(t *testing.T) {
+	r := &scanStandaloneReader{opts: &ScanReaderOptions{Scan: true}}
+	r.stat.EstimatedTotalKeys = 200
+	r.stat.SyncedKeyCount = 50
+	r.updateSyncPercent()
+	require.Equal(t, "25.00%", r.stat.SyncPercent)
 }
 
 func Test_formatSampleReply(t *testing.T) {

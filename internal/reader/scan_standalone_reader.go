@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/bits"
 	"regexp"
 	"strconv"
 	"strings"
@@ -28,6 +27,7 @@ type ScanReaderOptions struct {
 	Password              string           `mapstructure:"password" default:""`
 	Tls                   bool             `mapstructure:"tls" default:"false"`
 	TlsConfig             client.TlsConfig `mapstructure:"tls_config" default:"{}"`
+	ReadMode              string           `mapstructure:"read_mode" default:"dump"`
 	Scan                  bool             `mapstructure:"scan" default:"true"`
 	KSN                   bool             `mapstructure:"ksn" default:"false"`
 	DBS                   []int            `mapstructure:"dbs"`
@@ -68,15 +68,17 @@ type scanStandaloneReader struct {
 	scanPaused      atomic.Bool
 
 	stat struct {
-		Name              string  `json:"name"`
-		ScanFinished      bool    `json:"scan_finished"`
-		ScanDbId          int     `json:"scan_dbId"`
-		ScanCursor        uint64  `json:"scan_cursor"`
-		ScanPercentByDbId string  `json:"scan_percent"`
-		SyncedKeyCount    int64   `json:"synced_key_count"`
-		SyncedKeyOps      float64 `json:"synced_key_ops"`
-		NeedUpdateCount   int64   `json:"need_update_count"`
-		KSNDroppedCount   int64   `json:"ksn_dropped_count"`
+		Name               string  `json:"name"`
+		ScanFinished       bool    `json:"scan_finished"`
+		ScanDbId           int     `json:"scan_dbId"`
+		ScanCursor         uint64  `json:"scan_cursor"`
+		SyncPercent        string  `json:"sync_percent"`
+		SyncedKeyCount     int64   `json:"synced_key_count"`
+		SyncedKeyOps       float64 `json:"synced_key_ops"`
+		NeedUpdateCount    int64   `json:"need_update_count"`
+		KSNDroppedCount    int64   `json:"ksn_dropped_count"`
+		EstimatedTotalKeys int64   `json:"estimated_total_keys"`
+		ScannedKeyCount    int64   `json:"scanned_key_count"`
 
 		lastSyncedKeyCount          int64
 		lastSyncedKeyUpdateTSSecond float64
@@ -212,6 +214,39 @@ func (r *scanStandaloneReader) resolveScanDBs(c *client.Redis) []int {
 	return dbs
 }
 
+func (r *scanStandaloneReader) updateEstimatedTotalKeys(info string, dbs []int) {
+	counts := utils.ParseDBKeyCounts(info)
+	var total int64
+	for _, db := range dbs {
+		total += counts[db]
+	}
+	r.stat.EstimatedTotalKeys = total
+	r.updateSyncPercent()
+}
+
+func (r *scanStandaloneReader) updateSyncPercent() {
+	total := r.stat.EstimatedTotalKeys
+	if total <= 0 {
+		if r.stat.ScannedKeyCount > 0 {
+			total = r.stat.ScannedKeyCount + r.stat.NeedUpdateCount
+		} else if r.stat.SyncedKeyCount+r.stat.NeedUpdateCount > 0 {
+			total = r.stat.SyncedKeyCount + r.stat.NeedUpdateCount
+		}
+	}
+	if total <= 0 {
+		r.stat.SyncPercent = "0.00%"
+		return
+	}
+	progress := float64(r.stat.SyncedKeyCount) / float64(total) * 100
+	if progress > 100 {
+		progress = 100
+	}
+	if progress < 0 {
+		progress = 0
+	}
+	r.stat.SyncPercent = fmt.Sprintf("%.2f%%", progress)
+}
+
 func (r *scanStandaloneReader) logStartupSamples() {
 	if !r.opts.SampleOnStart {
 		return
@@ -224,6 +259,10 @@ func (r *scanStandaloneReader) logStartupSamples() {
 	defer c.Close()
 
 	dbs := r.resolveScanDBs(c)
+	reply, err := r.doSourceCommand(c, "info", "keyspace")
+	if err == nil {
+		r.updateEstimatedTotalKeys(reply.(string), dbs)
+	}
 	for _, dbId := range dbs {
 		r.logStartupSamplesForDB(c, dbId, sampleCount)
 	}
@@ -340,6 +379,116 @@ func truncateSampleValue(value string, maxLen int) string {
 	return value[:maxLen-3] + "..."
 }
 
+func (r *scanStandaloneReader) useCommandReadMode() bool {
+	return strings.EqualFold(strings.TrimSpace(r.opts.ReadMode), "command")
+}
+
+func (r *scanStandaloneReader) shouldSkipSourceType(typeStr string) bool {
+	for _, skipType := range r.opts.SkipUnknownType {
+		if strings.EqualFold(typeStr, skipType) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *scanStandaloneReader) getRewriteBatchSize() int {
+	if config.Opt.Advanced.RewriteCollectionBatchSize <= 0 {
+		return 128
+	}
+	return config.Opt.Advanced.RewriteCollectionBatchSize
+}
+
+func replyToString(v interface{}) (string, error) {
+	switch x := v.(type) {
+	case string:
+		return x, nil
+	case []byte:
+		return string(x), nil
+	default:
+		return "", fmt.Errorf("reply is not string, type=%T", v)
+	}
+}
+
+func replyToStringSlice(v interface{}) ([]string, error) {
+	items, ok := v.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("reply is not array, type=%T", v)
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		s, err := replyToString(item)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func scanReplyToCursorAndItems(reply interface{}) (uint64, []string, error) {
+	array, ok := reply.([]interface{})
+	if !ok || len(array) != 2 {
+		return 0, nil, fmt.Errorf("scan-like reply shape invalid: %T", reply)
+	}
+	cursorStr, err := replyToString(array[0])
+	if err != nil {
+		return 0, nil, err
+	}
+	cursor, err := strconv.ParseUint(cursorStr, 10, 64)
+	if err != nil {
+		return 0, nil, err
+	}
+	items, err := replyToStringSlice(array[1])
+	if err != nil {
+		return 0, nil, err
+	}
+	return cursor, items, nil
+}
+
+func (r *scanStandaloneReader) emitEntry(dbId int, argv ...string) {
+	e := entry.NewEntry()
+	e.DbId = dbId
+	e.Argv = argv
+	r.ch <- e
+}
+
+func (r *scanStandaloneReader) emitCommandBatches(dbId int, key string, cmd string, values []string) {
+	if len(values) == 0 {
+		return
+	}
+	batchSize := r.getRewriteBatchSize()
+	for i := 0; i < len(values); i += batchSize {
+		end := i + batchSize
+		if end > len(values) {
+			end = len(values)
+		}
+		argv := make([]string, 2, 2+(end-i))
+		argv[0] = cmd
+		argv[1] = key
+		argv = append(argv, values[i:end]...)
+		r.emitEntry(dbId, argv...)
+	}
+}
+
+func (r *scanStandaloneReader) emitPairCommandBatches(dbId int, key string, cmd string, pairs []string) {
+	if len(pairs) == 0 {
+		return
+	}
+	batchSize := r.getRewriteBatchSize() * 2
+	for i := 0; i < len(pairs); i += batchSize {
+		end := i + batchSize
+		if end > len(pairs) {
+			end = len(pairs)
+		}
+		argv := make([]string, 2, 2+(end-i))
+		argv[0] = cmd
+		argv[1] = key
+		argv = append(argv, pairs[i:end]...)
+		r.emitEntry(dbId, argv...)
+	}
+}
+
 func (r *scanStandaloneReader) reconnectSource(c *client.Redis, reason error) bool {
 	if !config.Opt.Advanced.IOReconnect || !client.IsReconnectableIOError(reason) {
 		return false
@@ -436,6 +585,150 @@ func (r *scanStandaloneReader) resendDumpSequence(dbId int, key string) {
 	r.sendDumpSequence(dbId, key)
 }
 
+func (r *scanStandaloneReader) doSourceCommandWithReconnect(c *client.Redis, dbId int, args ...interface{}) interface{} {
+	for {
+		reply, err := r.doSourceCommand(c, args...)
+		if err == nil {
+			return reply
+		}
+		if errors.Is(err, proto.Nil) {
+			return nil
+		}
+		if !r.reconnectSource(c, err) {
+			log.Panicf(err.Error())
+		}
+		r.selectSourceDB(c, dbId)
+	}
+}
+
+func (r *scanStandaloneReader) fetchSourceType(c *client.Redis, dbId int, key string) string {
+	reply := r.doSourceCommandWithReconnect(c, dbId, "TYPE", key)
+	typeStr, err := replyToString(reply)
+	if err != nil {
+		log.Panicf("type reply parse failed. key=[%s], err=[%v]", key, err)
+	}
+	return strings.ToLower(typeStr)
+}
+
+func (r *scanStandaloneReader) fetchSourcePTTL(c *client.Redis, dbId int, key string) int {
+	reply := r.doSourceCommandWithReconnect(c, dbId, "PTTL", key)
+	switch v := reply.(type) {
+	case int64:
+		pttl := int(v)
+		if pttl == 0 {
+			return 1
+		}
+		if pttl == -1 {
+			return 0
+		}
+		return pttl
+	case string:
+		log.Panicf("pttl reply is string, key=[%s], pttl=[%s]", key, v)
+	default:
+		log.Panicf("unexpected pttl reply type. key=[%s], type=%T", key, reply)
+	}
+	return 0
+}
+
+func (r *scanStandaloneReader) rewriteKeyByCommand(dbId int, key string) bool {
+	c := r.dumpClient
+	keyType := r.fetchSourceType(c, dbId, key)
+	if keyType == "none" {
+		return false
+	}
+	if r.shouldSkipSourceType(keyType) {
+		log.Infof("skip restore key=[%s] type=[%s]", key, keyType)
+		return false
+	}
+
+	pttl := r.fetchSourcePTTL(c, dbId, key)
+	if pttl == -2 {
+		return false
+	}
+
+	switch keyType {
+	case "string":
+		reply := r.doSourceCommandWithReconnect(c, dbId, "GET", key)
+		if reply == nil {
+			return false
+		}
+		value, err := replyToString(reply)
+		if err != nil {
+			log.Panicf("get reply parse failed. key=[%s], err=[%v]", key, err)
+		}
+		r.emitEntry(dbId, "SET", key, value)
+	case "hash":
+		r.emitEntry(dbId, "DEL", key)
+		cursor := uint64(0)
+		for {
+			reply := r.doSourceCommandWithReconnect(c, dbId, "HSCAN", key, strconv.FormatUint(cursor, 10), "COUNT", r.getRewriteBatchSize())
+			nextCursor, items, err := scanReplyToCursorAndItems(reply)
+			if err != nil {
+				log.Panicf("hscan reply parse failed. key=[%s], err=[%v]", key, err)
+			}
+			r.emitPairCommandBatches(dbId, key, "HSET", items)
+			cursor = nextCursor
+			if cursor == 0 {
+				break
+			}
+		}
+	case "list":
+		reply := r.doSourceCommandWithReconnect(c, dbId, "LLEN", key)
+		listLen, ok := reply.(int64)
+		if !ok {
+			log.Panicf("llen reply type invalid. key=[%s], type=%T", key, reply)
+		}
+		r.emitEntry(dbId, "DEL", key)
+		batchSize := r.getRewriteBatchSize()
+		for start := 0; start < int(listLen); start += batchSize {
+			stop := start + batchSize - 1
+			reply := r.doSourceCommandWithReconnect(c, dbId, "LRANGE", key, start, stop)
+			items, err := replyToStringSlice(reply)
+			if err != nil {
+				log.Panicf("lrange reply parse failed. key=[%s], start=[%d], err=[%v]", key, start, err)
+			}
+			r.emitCommandBatches(dbId, key, "RPUSH", items)
+		}
+	case "set":
+		r.emitEntry(dbId, "DEL", key)
+		cursor := uint64(0)
+		for {
+			reply := r.doSourceCommandWithReconnect(c, dbId, "SSCAN", key, strconv.FormatUint(cursor, 10), "COUNT", r.getRewriteBatchSize())
+			nextCursor, items, err := scanReplyToCursorAndItems(reply)
+			if err != nil {
+				log.Panicf("sscan reply parse failed. key=[%s], err=[%v]", key, err)
+			}
+			r.emitCommandBatches(dbId, key, "SADD", items)
+			cursor = nextCursor
+			if cursor == 0 {
+				break
+			}
+		}
+	case "zset":
+		r.emitEntry(dbId, "DEL", key)
+		cursor := uint64(0)
+		for {
+			reply := r.doSourceCommandWithReconnect(c, dbId, "ZSCAN", key, strconv.FormatUint(cursor, 10), "COUNT", r.getRewriteBatchSize())
+			nextCursor, items, err := scanReplyToCursorAndItems(reply)
+			if err != nil {
+				log.Panicf("zscan reply parse failed. key=[%s], err=[%v]", key, err)
+			}
+			r.emitPairCommandBatches(dbId, key, "ZADD", items)
+			cursor = nextCursor
+			if cursor == 0 {
+				break
+			}
+		}
+	default:
+		log.Panicf("scan_reader command read mode does not support type=[%s], key=[%s]. use read_mode=dump or skip_unknown_type", keyType, key)
+	}
+
+	if pttl != 0 {
+		r.emitEntry(dbId, "PEXPIRE", key, strconv.Itoa(pttl))
+	}
+	return true
+}
+
 func (r *scanStandaloneReader) subscribe() {
 	c := client.NewRedisClient(r.ctx, r.opts.Address, r.opts.Username, r.opts.Password, r.opts.Tls, r.opts.TlsConfig, r.opts.PreferReplica)
 	log.Infof("[%s] scanStandaloneReader subscribe started. dbs=[%v]", r.stat.Name, r.dbs)
@@ -525,6 +818,8 @@ func (r *scanStandaloneReader) subscribe() {
 				continue
 			}
 			r.needDumpQueue.Put(dbKey{db: dbIdInt, key: key})
+			r.stat.NeedUpdateCount = int64(r.needDumpQueue.Len())
+			r.updateSyncPercent()
 		}
 	}
 }
@@ -538,6 +833,7 @@ func (r *scanStandaloneReader) scan() {
 			info, err := r.doSourceCommand(c, "info", "keyspace")
 			if err == nil {
 				dbs = utils.ParseDBs(info.(string))
+				r.updateEstimatedTotalKeys(info.(string), dbs)
 				break
 			}
 			if !r.reconnectSource(c, err) {
@@ -568,12 +864,14 @@ func (r *scanStandaloneReader) scan() {
 			cursor, keys = r.scanKeys(c, dbId, cursor, count)
 			for _, key := range keys {
 				r.needDumpQueue.Put(dbKey{dbId, key}) // pass value not pointer
+				r.stat.ScannedKeyCount++
 			}
 
 			// stat
 			r.stat.ScanCursor = cursor
 			r.stat.ScanDbId = dbId
-			r.stat.ScanPercentByDbId = fmt.Sprintf("%.2f%%", float64(bits.Reverse64(cursor))/float64(^uint(0))*100)
+			r.stat.NeedUpdateCount = int64(r.needDumpQueue.Len())
+			r.updateSyncPercent()
 
 			if cursor == 0 {
 				break
@@ -599,12 +897,15 @@ func (r *scanStandaloneReader) dump() {
 
 	for item := range r.needDumpQueue.Ch {
 		r.stat.NeedUpdateCount = int64(r.needDumpQueue.Len())
+		r.updateSyncPercent()
 		dbId := item.(dbKey).db
 		key := item.(dbKey).key
 		if nowDbId != dbId {
 			nowDbId = dbId
 		}
-		r.sendDumpSequence(dbId, key)
+		if !r.useCommandReadMode() {
+			r.sendDumpSequence(dbId, key)
+		}
 		r.needRestoreChan <- &needRestoreItem{dbId, key}
 	}
 	close(r.needRestoreChan)
@@ -622,6 +923,17 @@ func (r *scanStandaloneReader) restore() {
 		key := item.key
 		if nowDbId != dbId {
 			nowDbId = dbId
+			if r.useCommandReadMode() {
+				r.selectSourceDB(r.dumpClient, dbId)
+			}
+		}
+		if r.useCommandReadMode() {
+			if r.rewriteKeyByCommand(dbId, key) {
+				r.stat.SyncedKeyCount++
+				r.stat.NeedUpdateCount = int64(r.needDumpQueue.Len())
+				r.updateSyncPercent()
+			}
+			continue
 		}
 	retryReceive:
 		reply, err := r.dumpClient.Receive()
@@ -648,14 +960,7 @@ func (r *scanStandaloneReader) restore() {
 				log.Panicf(err3.Error())
 			}
 			typeStr := iType.(string)
-			// type in SkipUnknownType
-			skip := false
-			for _, skipType := range r.opts.SkipUnknownType {
-				if strings.EqualFold(typeStr, skipType) {
-					skip = true
-				}
-			}
-			if skip {
+			if r.shouldSkipSourceType(typeStr) {
 				log.Infof("skip restore key=[%s] type=[%s]", key, typeStr)
 				continue
 			}
@@ -713,6 +1018,8 @@ func (r *scanStandaloneReader) restore() {
 				r.ch <- e
 			}
 			r.stat.SyncedKeyCount++
+			r.stat.NeedUpdateCount = int64(r.needDumpQueue.Len())
+			r.updateSyncPercent()
 		} else {
 			argv := []string{"RESTORE", key, strconv.Itoa(pttl), dump}
 			if config.Opt.Advanced.RDBRestoreCommandBehavior == "rewrite" {
@@ -723,6 +1030,8 @@ func (r *scanStandaloneReader) restore() {
 				Argv: argv,
 			}
 			r.stat.SyncedKeyCount++
+			r.stat.NeedUpdateCount = int64(r.needDumpQueue.Len())
+			r.updateSyncPercent()
 		}
 	}
 	log.Infof("[%s] scanStandaloneReader restore finished.", r.stat.Name)
@@ -738,8 +1047,8 @@ func (r *scanStandaloneReader) StatusString() string {
 		return fmt.Sprintf("queue_len=[%d], scan_paused=[%t], synced_key_count=[%d], synced_key_ops=[%.2f], need_update_count=[%d]",
 			r.getQueueLen(), r.scanPaused.Load(), r.stat.SyncedKeyCount, r.stat.SyncedKeyOps, r.stat.NeedUpdateCount)
 	}
-	return fmt.Sprintf("scan_dbid=[%d], scan_percent=[%s], queue_len=[%d], scan_paused=[%t], synced_key_count=[%d], synced_key_ops=[%.2f], need_update_count=[%d]",
-		r.stat.ScanDbId, r.stat.ScanPercentByDbId, r.getQueueLen(), r.scanPaused.Load(), r.stat.SyncedKeyCount, r.stat.SyncedKeyOps, r.stat.NeedUpdateCount)
+	return fmt.Sprintf("scan_dbid=[%d], sync_percent=[%s], queue_len=[%d], scan_paused=[%t], synced_key_count=[%d], synced_key_ops=[%.2f], need_update_count=[%d]",
+		r.stat.ScanDbId, r.stat.SyncPercent, r.getQueueLen(), r.scanPaused.Load(), r.stat.SyncedKeyCount, r.stat.SyncedKeyOps, r.stat.NeedUpdateCount)
 }
 
 func (r *scanStandaloneReader) StatusConsistent() bool {

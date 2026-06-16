@@ -1,5 +1,7 @@
 # RedisShake: Redis Data Transformation and Migration Tool
 
+> This repository is an `eloqkv`-maintained fork of RedisShake 4.x, based on the upstream project from `tair-opensource`.
+
 [![CI](https://img.shields.io/github/actions/workflow/status/tair-opensource/RedisShake/ci.yml?branch=v4&label=CI
 )](https://github.com/tair-opensource/RedisShake/actions/workflows/ci.yml)
 [![Website](https://img.shields.io/website?url=https%3A%2F%2Ftair-opensource.github.io%2FRedisShake%2F&up_message=%E4%B8%AD%E6%96%87%20%2F%20English&up_color=red&label=Doc
@@ -55,6 +57,14 @@ cd RedisShake
 sh build.sh
 ```
 
+4. Build your own Docker image:
+```shell
+docker build \
+    --build-arg VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD) \
+    --build-arg COMMIT=$(git rev-parse --short HEAD) \
+    -t eloqdata/redisshake:eloqdata-4.6.0 .
+```
+
 ### For LLM Agents
 
 Copy and paste this prompt to your LLM agent (Claude Code, Cursor, etc.):
@@ -87,6 +97,48 @@ block_key_prefix = ["temp:", "cache:"]
 ```
 
 For more help, check the [docs](https://tair-opensource.github.io/RedisShake/zh/guide/mode.html).
+
+## Fork Notes
+
+This fork is maintained by `eloqkv`. Unless otherwise stated, upstream design and most documentation still follow `tair-opensource/RedisShake`, while fork-specific fixes and operational conventions are maintained in this repository.
+
+## Build And Update Docker Image
+
+Build a local image:
+
+```shell
+docker build \
+    --build-arg VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD) \
+    --build-arg COMMIT=$(git rev-parse --short HEAD) \
+    -t eloqdata/redisshake:eloqdata-4.6.0 .
+```
+
+Push the updated image:
+
+```shell
+docker push eloqdata/redisshake:eloqdata-4.6.0
+```
+
+## Run With Docker Image
+
+Run with environment variables:
+
+```shell
+docker run --rm --network host \
+    -e SYNC=true \
+    -e SHAKE_SRC_ADDRESS=127.0.0.1:6379 \
+    -e SHAKE_DST_ADDRESS=127.0.0.1:6380 \
+    eloqdata/redisshake:eloqdata-4.6.0
+```
+
+Run with a local config file:
+
+```shell
+docker run --rm --network host \
+    -v $(pwd)/shake.toml:/app/shake.toml:ro \
+    eloqdata/redisshake:eloqdata-4.6.0 \
+    ./redis-shake /app/shake.toml
+```
 
 ## Limitations
 

@@ -14,7 +14,7 @@ Scan Reader has two stages: SCAN and KSN. The SCAN stage is for full synchroniza
 
 ### Full Data
 
-**SCAN stage**: Enabled by default, can be disabled through the `scan` configuration. `scan_reader` uses the `SCAN` command to traverse all Keys in the source database, then uses `DUMP` to get the Value corresponding to the Key, and writes to the destination through the `RESTORE` command, completing full data synchronization.
+**SCAN stage**: Enabled by default, can be disabled through the `scan` configuration. `scan_reader` uses the `SCAN` command to traverse all Keys in the source database. By default it uses `DUMP` to get the Value corresponding to the Key and writes it to the destination through the `RESTORE` command. You can also switch to `read_mode = "command"`, in which case RedisShake reads source data with standard Redis commands such as `GET`, `HSCAN`, `LRANGE`, `SSCAN`, and `ZSCAN`, then rewrites them into normal write commands for the destination.
 
 1. Redis's `SCAN` command only guarantees that Keys that <u>exist throughout the SCAN operation</u> will definitely be returned, but newly written Keys may be missed, and Keys deleted during this period may have already been written to the destination.
 2. During the SCAN stage, RedisShake will calculate the current synchronization progress through the cursor returned by the `SCAN command`. This progress has a large error and is for reference only. For non-Redis databases, the cursor calculation method is different from Redis, so you may see incorrect progress displays, which can be ignored.
@@ -23,16 +23,22 @@ Scan Reader has two stages: SCAN and KSN. The SCAN stage is for full synchroniza
 
 **KSN stage**: Disabled by default, can be enabled through `ksn`, which can solve the problem of missing Keys during the SCAN stage. Incremental data synchronization does not start after the SCAN stage ends, but proceeds simultaneously with it, and continues after the SCAN stage ends until RedisShake exits.
 
-`ksn` uses [Redis keyspace notifications](https://redis.io/docs/manual/keyspace-notifications/) capability to subscribe to Key changes. Specifically, RedisShake will use the `psubscribe` command to subscribe to `__keyevent@*__:*`. When a Key changes, RedisShake will receive the modified Key, then use the `DUMP` and `RESTORE` commands to read the content of the Key from the source and write it to the destination.
+`ksn` uses [Redis keyspace notifications](https://redis.io/docs/manual/keyspace-notifications/) capability to subscribe to Key changes. Specifically, RedisShake will use the `psubscribe` command to subscribe to `__keyevent@*__:*`. When a Key changes, RedisShake will receive the modified Key and then read the source data according to the configured `read_mode`.
 1. Redis does not enable the `notify-keyspace-events` configuration by default. It needs to be manually enabled, ensuring the value contains `AE`.
 2. If the source disconnects during the KSN stage, consider appropriately increasing the value of `client-output-buffer-limit pubsub`. [802](https://github.com/tair-opensource/RedisShake/issues/802)
 3. `Redis keyspace notifications` will not detect `FLUSHALL` and `FLUSHDB` commands, so when using the `ksn` parameter, ensure that the source database does not execute these two commands.
 
 ### Performance Impact
 
-Both SCAN and KSN stages use the DUMP command to obtain data. The DUMP command is CPU-intensive and will cause high pressure on the source. It needs to be used carefully to avoid affecting the availability of the source instance.
+The default `dump` mode uses the DUMP command in both SCAN and KSN stages. DUMP is CPU-intensive and can put heavy pressure on the source. The `command` mode avoids DUMP, but replaces it with more standard read commands; for large collections this often lowers peak CPU per command while increasing command count and network round trips.
 * For the SCAN stage, you can adjust the `count` parameter to reduce the pressure on the source. It's recommended to start from 1 and gradually increase.
 * For the KSN stage, there are currently no adjustable parameters. The decision to enable it should be based on an assessment of the write request volume at the source.
+
+### Limitations of `read_mode = "command"`
+
+* Currently supports only the standard `string`, `hash`, `list`, `set`, and `zset` data types.
+* `stream`, module types, and other special types are not supported in this mode. Use `skip_unknown_type` if you need to skip them.
+* This mode emits normal write commands instead of `RESTORE`, so `rdb_restore_command_behavior` does not apply.
 
 Reference data for performance impact: When the source instance's write QPS is about 150,000, the source CPU usage is 47%. After enabling RedisShake, the source CPU usage becomes 91%.
 
@@ -44,6 +50,7 @@ address = "127.0.0.1:6379" # when cluster is true, set address to one of the clu
 username = ""              # keep empty if not using ACL
 password = ""              # keep empty if no authentication is required
 tls = false
+read_mode = "dump"        # "dump" uses DUMP/RESTORE, "command" reads values via standard Redis commands
 dbs = []                   # set you want to scan dbs such as [1,5,7], if you don't want to scan all
 scan = true                # set to false if you don't want to scan keys
 ksn = false                # set to true to enabled Redis keyspace notifications (KSN) subscription
@@ -63,6 +70,7 @@ sample_value_max_len = 256 # truncate sampled value previews to this many charac
     * When the source uses traditional accounts, only configure `password`
     * When the source has no authentication, do not configure `username` and `password`
 * `tls`: Whether the source has enabled TLS/SSL. No need to configure a certificate because RedisShake does not verify the server certificate
+* `read_mode`: How RedisShake reads source values. `dump` is the default and uses `DUMP`/`RESTORE`; `command` avoids `DUMP` and reads data with standard Redis commands based on the key type.
 * `dbs`: For non-cluster mode sources, supports synchronizing only specified DB libraries.
 * `scan`: Whether to enable the SCAN stage. When set to false, RedisShake will skip the full synchronization stage
 * `ksn`: After enabling the `ksn` parameter, RedisShake will subscribe to Key changes at the source to achieve incremental synchronization
