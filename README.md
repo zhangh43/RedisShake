@@ -1,7 +1,5 @@
 # RedisShake: Redis Data Transformation and Migration Tool
 
-> This repository is an `eloqkv`-maintained fork of RedisShake 4.x, based on the upstream project from `tair-opensource`.
-
 [![CI](https://img.shields.io/github/actions/workflow/status/tair-opensource/RedisShake/ci.yml?branch=v4&label=CI
 )](https://github.com/tair-opensource/RedisShake/actions/workflows/ci.yml)
 [![Website](https://img.shields.io/website?url=https%3A%2F%2Ftair-opensource.github.io%2FRedisShake%2F&up_message=%E4%B8%AD%E6%96%87%20%2F%20English&up_color=red&label=Doc
@@ -57,14 +55,6 @@ cd RedisShake
 sh build.sh
 ```
 
-4. Build your own Docker image:
-```shell
-docker build \
-    --build-arg VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD) \
-    --build-arg COMMIT=$(git rev-parse --short HEAD) \
-    -t eloqdata/redisshake:eloqdata-4.6.0 .
-```
-
 ### For LLM Agents
 
 Copy and paste this prompt to your LLM agent (Claude Code, Cursor, etc.):
@@ -98,13 +88,13 @@ block_key_prefix = ["temp:", "cache:"]
 
 For more help, check the [docs](https://tair-opensource.github.io/RedisShake/zh/guide/mode.html).
 
-## Fork Notes
+---
 
-This fork is maintained by `eloqkv`. Unless otherwise stated, upstream design and most documentation still follow `tair-opensource/RedisShake`, while fork-specific fixes and operational conventions are maintained in this repository.
+## ELOQKV Fork
 
-## Build And Update Docker Image
+This repository is an `eloqkv`-maintained fork of RedisShake 4.x.
 
-Build a local image:
+### Update Docker Image
 
 ```shell
 docker build \
@@ -119,7 +109,7 @@ Push the updated image:
 docker push eloqdata/redisshake:eloqdata-4.6.0
 ```
 
-## Run With Docker Image
+### Use Docker Image
 
 Run with environment variables:
 
